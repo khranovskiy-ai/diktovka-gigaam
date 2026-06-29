@@ -1,0 +1,21 @@
+{
+  "hotkey": "<alt>",
+  "mode": "ptt",
+  "language": "ru",
+  "model": "gigaam-v3-e2e-rnnt",
+  "backend": "gigaam",
+  "gigaam_fallback_whisper": false,
+  "sample_rate": 16000,
+  "channels": 1,
+  "auto_paste": true,
+  "refocus_target": false,
+  "paste_target_bundle": "",
+  "play_sound": true,
+  "show_tray": false,
+  "show_cursor_indicator": false,
+  "newline_after_dictation_within_sec": 0,
+  "trim_silence_ms": 200,
+  "min_duration_ms": 300,
+  "mac_low_cpu_mode": true,
+  "log_file": "~/.config/whisper-skill/dictation.log"
+}

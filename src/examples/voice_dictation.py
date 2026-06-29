@@ -535,12 +535,26 @@ def _paste_debug(msg: str) -> None:
 
 def paste_from_clipboard() -> None:
     """Симулировать Cmd+V (Mac) или Ctrl+V (Linux/Win). Пишет диагностику в paste_debug.log."""
-    # macOS: сначала pynput (как ручное нажатие), потом System Events как запас.
+    # macOS: сначала Quartz Cmd+V с ЯВНЫМ флагом Command, потом pynput, потом System Events.
     if platform.system() == "Darwin":
-        # 1) pynput Cmd+V — реальный CGEvent, ровно как твоё ручное Cmd+V.
-        #    Нужен только «Универсальный доступ» (выдан). Electron-приложения
-        #    (VS Code) принимают именно такие события; System Events keystroke
-        #    они часто игнорируют - поэтому раньше авто-вставка не доходила.
+        # 0) Quartz Cmd+V с явным флагом Command — НАДЁЖНЫЙ путь.
+        #    pynput в этой версии НЕ применяет модификатор Command к 'v' → синтетический
+        #    Cmd+V не срабатывал (текст копировался в буфер, в логе «Вставлено», но вставки
+        #    не было). Прямой CGEvent с kCGEventFlagMaskCommand на 'v' (keycode 9) вставляет
+        #    корректно (проверено в TextEdit и в Electron/VS Code).
+        try:
+            import Quartz as _Q
+            for _down in (True, False):
+                _e = _Q.CGEventCreateKeyboardEvent(None, 9, _down)  # 9 = клавиша 'v'
+                _Q.CGEventSetFlags(_e, _Q.kCGEventFlagMaskCommand)
+                _Q.CGEventPost(_Q.kCGHIDEventTap, _e)
+            _paste_debug("quartz: sent Cmd+V (flag Command)")
+            print("📥 Вставлено (Cmd+V)")
+            return
+        except Exception as e:
+            _paste_debug(f"quartz: EXC {e}")
+
+        # 1) pynput Cmd+V — запасной (в этой версии модификатор может не применяться).
         try:
             from pynput.keyboard import Controller, Key
             kb = Controller()

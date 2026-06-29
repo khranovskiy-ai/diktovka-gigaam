@@ -957,6 +957,42 @@ def _activate_bundle(bundle_id: str) -> None:
 def main_loop(cfg: dict, cfg_path: Path):
     from pynput import keyboard
 
+    # --- macOS: держим перехват клавиш живым (фикс «оглох после паузы/сна/блокировки») ---
+    # pynput в этой версии НЕ переподнимает CGEventTap, когда macOS его отключает
+    # (по таймауту или после сна экрана/блокировки) — поток жив, рунлуп крутится, но
+    # перехват выключен, и хоткей перестаёт ловиться. Сохраняем созданный tap и
+    # периодически включаем его заново сторожем-потоком. Включение живого tap = no-op.
+    _tap_keepalive = {"enable": None}
+    if sys.platform == "darwin":
+        try:
+            from pynput._util import darwin as _pdarwin
+            from Quartz import CGEventTapEnable as _CGEventTapEnable
+            _tap_keepalive["enable"] = _CGEventTapEnable
+            _orig_create_tap = _pdarwin.ListenerMixin._create_event_tap
+            def _create_event_tap_keep(self):
+                tap = _orig_create_tap(self)
+                self._tap = tap
+                return tap
+            _pdarwin.ListenerMixin._create_event_tap = _create_event_tap_keep
+        except Exception as e:
+            logging.warning(f"tap keepalive patch failed: {e}")
+
+    def _start_tap_watchdog(listener):
+        """Каждые 2с переподнимает CGEventTap, если macOS его вырубил."""
+        enable = _tap_keepalive.get("enable")
+        if enable is None:
+            return
+        def _loop():
+            while getattr(listener, "running", True):
+                time.sleep(2.0)
+                tap = getattr(listener, "_tap", None)
+                if tap is not None:
+                    try:
+                        enable(tap, True)
+                    except Exception:
+                        pass
+        threading.Thread(target=_loop, daemon=True).start()
+
     # Lazy-import чтобы не падать на импортов при ошибке отсутствия пакетов
     try:
         from examples.common import transcribe
@@ -1207,6 +1243,7 @@ def main_loop(cfg: dict, cfg_path: Path):
             currently_pressed.discard(ck)
 
         with keyboard.Listener(on_press=on_press, on_release=on_release) as listener:
+            _start_tap_watchdog(listener)
             try:
                 listener.join()
             except KeyboardInterrupt:
@@ -1214,6 +1251,7 @@ def main_loop(cfg: dict, cfg_path: Path):
     else:
         # Toggle: нажал → старт, нажал ещё раз → стоп
         with keyboard.GlobalHotKeys({hotkey_str: toggle}) as listener:
+            _start_tap_watchdog(listener)
             try:
                 listener.join()
             except KeyboardInterrupt:

@@ -1256,12 +1256,67 @@ def main_loop(cfg: dict, cfg_path: Path):
                 stop_and_transcribe()
             currently_pressed.discard(ck)
 
-        with keyboard.Listener(on_press=on_press, on_release=on_release) as listener:
-            _start_tap_watchdog(listener)
+        # Супервайзер слуха: pynput-рунлуп ломается/зависает при сне-пробуждении Mac
+        # (CFRunLoopRunInMode возвращает не-timeout → поток слушателя выходит, ЛИБО
+        # рунлуп виснет после сна) → движок «глохнет», хотя процесс жив; переподнять
+        # старый CGEventTap уже бесполезно (рунлуп его не качает). Лечим ПЕРЕСОЗДАНИЕМ
+        # слушателя: новый Listener = новый tap + новый рунлуп. Триггеры пересоздания:
+        #   (а) поток слушателя умер (is_alive() == False — pynput при этом НЕ сбрасывает
+        #       running, поэтому проверяем именно is_alive());
+        #   (б) между тиками сторожа большой провал по часам = Mac спал (даже если поток
+        #       ещё жив, после сна tap событий не качает).
+        # При пересоздании чистим залипшее состояние: после сна остаётся is_recording=True
+        # (потерянное «отпускание» Option) и «зажатый» хоткей — иначе движок «глух».
+        def _reset_stuck_state(reason):
             try:
-                listener.join()
-            except KeyboardInterrupt:
+                currently_pressed.clear()
+                with state_lock:
+                    if state.is_recording:
+                        state.is_recording = False
+                        try:
+                            recorder.stop()
+                        except Exception:
+                            pass
+                logging.info(f"hearing revived ({reason}); stuck state reset")
+                print(f"♻️  Слух перезапущен ({reason}) — снова слушаю Option")
+            except Exception as e:
+                logging.warning(f"reset stuck state failed: {e}")
+
+        first = True
+        while True:
+            listener = keyboard.Listener(on_press=on_press, on_release=on_release)
+            listener.start()
+            try:
+                listener.wait()
+            except Exception:
                 pass
+            _start_tap_watchdog(listener)
+            if not first:
+                _reset_stuck_state("пересоздание слушателя после сна")
+            first = False
+            last_tick = time.time()
+            try:
+                while listener.is_alive():
+                    time.sleep(2.0)
+                    now = time.time()
+                    gap = now - last_tick
+                    last_tick = now
+                    if gap > 8.0:
+                        # провал по часам >> 2с = Mac спал → tap оглох, пересоздаём
+                        logging.info(f"sleep gap {gap:.0f}s detected — recreating listener")
+                        break
+            except KeyboardInterrupt:
+                try:
+                    listener.stop()
+                except Exception:
+                    pass
+                break
+            # поток умер или замечен сон → останавливаем старый слушатель и пересоздаём
+            try:
+                listener.stop()
+            except Exception:
+                pass
+            time.sleep(0.5)  # дать старому рунлупу освободить tap; защита от busy-loop
     else:
         # Toggle: нажал → старт, нажал ещё раз → стоп
         with keyboard.GlobalHotKeys({hotkey_str: toggle}) as listener:

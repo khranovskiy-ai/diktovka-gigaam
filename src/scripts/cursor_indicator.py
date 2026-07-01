@@ -2,12 +2,12 @@
 Тонкий indicator у курсора мыши.
 
 Два режима:
-- "recording" — маленькая мигающая красная точка (caret-style blink).
-- "transcribing" — вращающаяся янтарная катушка-бобина (как у старой
+- "recording" - маленькая мигающая красная точка (caret-style blink).
+- "transcribing" - вращающаяся янтарная катушка-бобина (как у старой
   кинокамеры): диск с тремя окошками на радиусе и центральной осью.
 
 Используется так: пока пользователь держит PTT-хоткей, индикатор в
-recording-режиме. Отпустил — переключаемся в transcribing, и показываем
+recording-режиме. Отпустил - переключаемся в transcribing, и показываем
 бобину до тех пор, пока распознанный текст не вставился в активное поле.
 
 Tk запускается в собственном daemon-thread'е (Tk не любит вызовы из чужих
@@ -17,8 +17,8 @@ Tk запускается в собственном daemon-thread'е (Tk не л
 ⚠️ macOS: НЕ ПОДДЕРЖИВАЕТСЯ. macOS Tk требует чтобы Tk() был на main thread
 (NSApplication привязан к main thread'у). Создание Tk в фоне даёт:
     NSInvalidArgumentException '-[NSApplication macOSVersion]: unrecognized selector'
-с последующим крашем процесса. С KeepAlive=true в LaunchAgent — бесконечный
-краш-цикл. Поэтому на macOS CursorIndicator.start() — no-op.
+с последующим крашем процесса. С KeepAlive=true в LaunchAgent - бесконечный
+краш-цикл. Поэтому на macOS CursorIndicator.start() - no-op.
 Пользователи Mac получают visual feedback через tray icon (TrayIcon).
 
 Windows-only нюанс: позиция курсора берётся через GetCursorPos из user32.
@@ -30,9 +30,9 @@ Windows-only нюанс: позиция курсора берётся через
     ind = CursorIndicator()
     ind.start()
     # ... начали запись ...
-    ind.show()                  # recording — мигающая точка
+    ind.show()                  # recording - мигающая точка
     # ... отпустили хоткей, идёт транскрибация и вставка ...
-    ind.show_transcribing()     # transcribing — крутится катушка
+    ind.show_transcribing()     # transcribing - крутится катушка
     # ... текст вставлен ...
     ind.hide()
     # ... выход ...
@@ -50,24 +50,24 @@ import time
 from typing import Optional, Tuple
 
 
-# Окно одинакового размера в обоих режимах — позиция относительно курсора
+# Окно одинакового размера в обоих режимах - позиция относительно курсора
 # не "прыгает" при переключении точка↔катушка.
 WIN_SIZE = 20
 CENTER_OFFSET_X = 13           # где центр окна относительно курсора (X)
-CENTER_OFFSET_Y = 10            # где центр окна относительно курсора (Y) — slightly lower
+CENTER_OFFSET_Y = 10            # где центр окна относительно курсора (Y) - slightly lower
 WIN_OFFSET_X = CENTER_OFFSET_X - WIN_SIZE // 2
 WIN_OFFSET_Y = CENTER_OFFSET_Y - WIN_SIZE // 2
 
-DOT_RADIUS = 1.5               # recording — крошечная точка
-REEL_OUTER_R = 6.075           # transcribing — внешний радиус катушки
+DOT_RADIUS = 1.5               # recording - крошечная точка
+REEL_OUTER_R = 6.075           # transcribing - внешний радиус катушки
 REEL_HOLE_R = 1.134            # окошки на катушке
 REEL_HOLES_DIST = 3.726        # радиус, на котором сидят окошки
 REEL_AXIS_R = 1.134            # центральная ось (отверстие посередине)
 REEL_PERIOD_S = 0.8            # один полный оборот катушки
 
 TRANSPARENT_BG = "#ff00ff"     # transparent-key colour (magenta) on Windows
-DEFAULT_DOT_COLOR = "#ef4444"  # red-500 — recording
-DEFAULT_REEL_COLOR = "#f4a261" # amber — transcribing (совпадает с цветом
+DEFAULT_DOT_COLOR = "#ef4444"  # red-500 - recording
+DEFAULT_REEL_COLOR = "#f4a261" # amber - transcribing (совпадает с цветом
                                # transcribing-state в tray icon)
 BLINK_PERIOD_S = 0.6           # один цикл on/off для точки
 TICK_MS = 33                   # ~30 fps
@@ -123,7 +123,7 @@ class CursorIndicator:
         self._thread = threading.Thread(target=self._run, daemon=True, name="cursor-indicator")
         # macOS не поддерживает Tk в non-main thread (NSInvalidArgumentException).
         # Класс молча превращается в no-op чтобы caller-код можно было оставить
-        # без условий — show()/hide()/stop() просто ничего не делают.
+        # без условий - show()/hide()/stop() просто ничего не делают.
         self._disabled_on_mac = platform.system() == "Darwin"
 
     # ─── Public API ─────────────────────────────────────────────────────
@@ -146,13 +146,13 @@ class CursorIndicator:
         self._stopped.wait(timeout=1.0)
 
     def show(self) -> None:
-        """Recording mode — blinking red dot."""
+        """Recording mode - blinking red dot."""
         if self._disabled_on_mac:
             return
         self._cmd_queue.put(("mode", "recording"))
 
     def show_transcribing(self) -> None:
-        """Transcribing mode — spinning amber film reel."""
+        """Transcribing mode - spinning amber film reel."""
         if self._disabled_on_mac:
             return
         self._cmd_queue.put(("mode", "transcribing"))
@@ -189,7 +189,7 @@ class CursorIndicator:
             self._win.wm_attributes("-transparentcolor", TRANSPARENT_BG)
         except Exception:
             pass
-        # Disable input — clicks pass through to whatever is below.
+        # Disable input - clicks pass through to whatever is below.
         try:
             self._win.wm_attributes("-disabled", True)
         except Exception:
@@ -276,7 +276,7 @@ class CursorIndicator:
         # smooth breath.
         phase = (self._anim_phase % BLINK_PERIOD_S) / BLINK_PERIOD_S
         if phase >= 0.5:
-            return  # off — leave canvas empty (transparent)
+            return  # off - leave canvas empty (transparent)
 
         cx = WIN_SIZE / 2
         cy = WIN_SIZE / 2
@@ -302,7 +302,7 @@ class CursorIndicator:
             fill=self.reel_color, outline="",
         )
 
-        # Three "windows" on the reel — filled with the transparent-key color
+        # Three "windows" on the reel - filled with the transparent-key color
         # so on Windows you literally see through them. They rotate together,
         # which makes the spin readable even at this tiny size.
         for i in range(3):

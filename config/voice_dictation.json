@@ -17,5 +17,7 @@
   "trim_silence_ms": 200,
   "min_duration_ms": 300,
   "mac_low_cpu_mode": true,
+  "idle_release_sec": 180,
+  "transcribe_stuck_sec": 120,
   "log_file": "~/.config/whisper-skill/dictation.log"
 }

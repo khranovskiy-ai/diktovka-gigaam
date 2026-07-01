@@ -2,8 +2,8 @@
 Общая обвязка для примеров.
 
 Решает две задачи:
-1. Автовыбор бэкенда — определяет железо и подгружает оптимальный (mlx / faster-whisper / whisper.cpp)
-2. Унифицированный интерфейс — `transcribe(audio_path, language)` возвращает одинаковую структуру вне зависимости от бэкенда
+1. Автовыбор бэкенда - определяет железо и подгружает оптимальный (mlx / faster-whisper / whisper.cpp)
+2. Унифицированный интерфейс - `transcribe(audio_path, language)` возвращает одинаковую структуру вне зависимости от бэкенда
 
 Использование:
     from examples.common import transcribe, save_srt
@@ -60,7 +60,7 @@ def _pick_backend() -> str:
     if _has_module("pywhispercpp"):
         return "cpp"
     raise RuntimeError(
-        "Не найден ни один whisper-бэкенд. Запусти scripts/detect_env.py — "
+        "Не найден ни один whisper-бэкенд. Запусти scripts/detect_env.py - "
         "он подскажет какой ставить под твоё железо."
     )
 
@@ -125,12 +125,12 @@ def transcribe(
     """
     Один файл → транскрибат. Универсально для всех бэкендов.
 
-    audio_path     — путь к аудио/видео. Поддерживается всё что ffmpeg умеет.
-    language       — "ru", "en", "kk", ... ; None = auto-detect (медленнее)
-    model_name     — имя модели. None = "large-v3-turbo" (рекомендованный дефолт)
-    word_timestamps — пословные метки (для CapCut-стиля сабов)
-    backend        — "mlx" | "faster" | "whisperx" | "cpp" | None (auto)
-    verbose        — печать прогресса
+    audio_path     - путь к аудио/видео. Поддерживается всё что ffmpeg умеет.
+    language       - "ru", "en", "kk", ... ; None = auto-detect (медленнее)
+    model_name     - имя модели. None = "large-v3-turbo" (рекомендованный дефолт)
+    word_timestamps - пословные метки (для CapCut-стиля сабов)
+    backend        - "mlx" | "faster" | "whisperx" | "cpp" | None (auto)
+    verbose        - печать прогресса
     """
     audio_path = str(Path(audio_path).resolve())
     if not Path(audio_path).exists():
@@ -175,7 +175,7 @@ def _transcribe_gigaam(audio, lang, model_name, word_ts, verbose):
     if model is None:
         # ВАЖНО (macOS): принудительно CPUExecutionProvider. CoreML-провайдер
         # onnxruntime падает на энкодере GigaAM ("Unable to compute the
-        # prediction", error code -1) — проверено 27.06.2026. CPU тут и так
+        # prediction", error code -1) - проверено 27.06.2026. CPU тут и так
         # быстрый (~30x realtime). Переопределяется env ONNX_ASR_PROVIDERS.
         providers = ["CPUExecutionProvider"]
         forced = os.environ.get("ONNX_ASR_PROVIDERS")
@@ -202,7 +202,7 @@ def _transcribe_gigaam(audio, lang, model_name, word_ts, verbose):
         raise
 
     text = (text or "").strip()
-    # onnx-asr.recognize отдаёт готовую строку без сегментных таймингов —
+    # onnx-asr.recognize отдаёт готовую строку без сегментных таймингов -
     # для диктовки они не нужны (вставляем текст у курсора). Один сегмент.
     segs = [Segment(start=0.0, end=0.0, text=text)] if text else []
     return Result(
@@ -424,18 +424,18 @@ def _ov_decode_window(audio_chunk, model, processor, lang, max_new):
 
 
 def _transcribe_openvino(audio, lang, model_name, word_ts, verbose):
-    """OpenVINO бэкенд — для Intel CPU/iGPU/NPU.
+    """OpenVINO бэкенд - для Intel CPU/iGPU/NPU.
 
     Модель ищется в ~/.cache/openvino-whisper/whisper-{model_name}-ov/.
     Конвертацию делает scripts/convert_openvino.py (запускается один раз).
 
-    Long-form (>30s): если установлен silero-vad — режем по паузам и
-    декодируем окна по 28s по очереди. Без silero-vad — single pass
+    Long-form (>30s): если установлен silero-vad - режем по паузам и
+    декодируем окна по 28s по очереди. Без silero-vad - single pass
     (Whisper обрежет до первых 30s; печатается warning).
 
     Контролируется env vars:
-        WHISPER_OV_DEVICE  — GPU (default), NPU, CPU, AUTO
-        WHISPER_OV_DIR     — переопределение пути к локальным IR-моделям
+        WHISPER_OV_DEVICE  - GPU (default), NPU, CPU, AUTO
+        WHISPER_OV_DIR     - переопределение пути к локальным IR-моделям
     """
     import soundfile as sf
     import numpy as np

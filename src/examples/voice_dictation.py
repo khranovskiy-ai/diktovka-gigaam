@@ -63,10 +63,13 @@ DEFAULT_CONFIG = {
     "log_file": None,                    # путь к файлу лога или null = stdout
     "trim_silence_ms": 200,              # обрезать тишину в начале/конце записи
     "min_duration_ms": 300,              # игнорировать слишком короткие записи (промахи кнопкой)
+    "max_record_sec": 90,                # потолок одной записи: дольше = потеряно отпускание Option, сторож сам завершит/сбросит
+    "idle_release_sec": 180,             # отпустить микрофон (закрыть поток, погасить оранжевую точку) после стольких секунд без диктовки; 0 = держать открытым всегда
+    "transcribe_stuck_sec": 120,         # если распознавание висит дольше - сбросить залипший флаг is_transcribing (сторож)
     # macOS-специфика: pystray/Tk известно жрут CPU в фоне на macOS
     # (NSRunLoop в non-main thread + Tk thread-safety). Этот флаг автоматически
     # отключает show_tray и show_cursor_indicator на macOS, оставляя CLI-вывод
-    # как единственный feedback. Если хочешь tray на Mac на свой страх и риск —
+    # как единственный feedback. Если хочешь tray на Mac на свой страх и риск -
     # поставь false (тогда show_tray/show_cursor_indicator будут уважаться).
     "mac_low_cpu_mode": True,
 }
@@ -96,7 +99,7 @@ def write_config(path: Path, cfg: dict) -> None:
 
 
 _MODEL_QUALITY_ORDER = [
-    # Best → worst. Turbo (distilled-decoder) — лучший компромисс скорость/качество,
+    # Best → worst. Turbo (distilled-decoder) - лучший компромисс скорость/качество,
     # но чуть слабее int8/int8-sym на сложных кейсах (шум, акцент).
     # int4 теряет в качестве заметнее всех.
     "large-v3",
@@ -109,7 +112,7 @@ _MODEL_QUALITY_ORDER = [
 
 
 def list_available_ov_models() -> list:
-    """Папки `whisper-*-ov` в ~/.cache/openvino-whisper/ — те, что openvino-
+    """Папки `whisper-*-ov` в ~/.cache/openvino-whisper/ - те, что openvino-
     backend умеет грузить (см. _transcribe_openvino в common.py).
     Возвращает model-name'ы в порядке убывания качества (best первый);
     модели вне whitelist'а уходят в конец alphabetically.
@@ -133,11 +136,11 @@ _single_instance_handle = None  # держим ссылку чтобы lock не
 
 
 def acquire_single_instance_lock(timeout_seconds: float = 2.0) -> bool:
-    """Захватить named mutex (Windows) / file lock (Unix). True — захватили.
-    False — другая копия уже работает.
+    """Захватить named mutex (Windows) / file lock (Unix). True - захватили.
+    False - другая копия уже работает.
 
     timeout_seconds покрывает self-restart: старая копия только что вызвала
-    os._exit, новая стартует, ОС ещё не успела освободить lock — повторяем.
+    os._exit, новая стартует, ОС ещё не успела освободить lock - повторяем.
     """
     global _single_instance_handle
     deadline = time.monotonic() + timeout_seconds
@@ -159,7 +162,7 @@ def acquire_single_instance_lock(timeout_seconds: float = 2.0) -> bool:
         try:
             import fcntl
         except ImportError:
-            return True  # нет fcntl — пропускаем lock (Win-вариант покрыт выше)
+            return True  # нет fcntl - пропускаем lock (Win-вариант покрыт выше)
         lock_path = Path.home() / ".config" / "whisper-skill" / "voice_dictation.lock"
         lock_path.parent.mkdir(parents=True, exist_ok=True)
         while True:
@@ -205,7 +208,7 @@ def restart_self() -> None:
             start_new_session=True,
             close_fds=True,
         )
-    # os._exit — мгновенный hard exit без atexit/finally; ОС освободит mutex/lock,
+    # os._exit - мгновенный hard exit без atexit/finally; ОС освободит mutex/lock,
     # новая копия подхватит после retry в acquire_single_instance_lock.
     os._exit(0)
 
@@ -233,48 +236,234 @@ def setup_wizard():
 
 
 class AudioRecorder:
-    def __init__(self, sample_rate: int = 16000, channels: int = 1):
+    """Запись микрофона для push-to-talk.
+
+    🔑🔑🔑🔑🔑 КОРНЕВОЙ ФИКС РЕЦИДИВА «снова сломалась» (01.07.2026) -
+    ПЕРСИСТЕНТНЫЙ АУДИОПОТОК. Устраняет САМ ТРИГГЕР пятого (и главного по
+    частоте) режима отказа, а не лечит его постфактум.
+
+    Как было: на КАЖДУЮ диктовку открывался новый sd.InputStream (start) и
+    закрывался (stop). То есть на каждый жест шли переходы состояния устройства
+    CoreAudio - HAL DeviceStart / HAL DeviceStop. Именно эти переходы клинят
+    мьютекс HAL (`HALB_Mutex::Lock → __psynch_mutexwait`): один зависший
+    `stop()` оставлял устройство полу-остановленным с ЗАХВАЧЕННЫМ мьютексом, и
+    дальше ВСЕ `open()` в этом процессе висли по таймауту. Четыре внутренних
+    сторожа + супервайзер это ЛОВИЛИ, но оставляли окно, где владелец видел
+    «сломалось» - отсюда повторяющееся обращение.
+
+    Как стало: поток открывается ОДИН раз (лениво, на первой диктовке) и живёт
+    всё время работы движка. На каждую диктовку мы лишь ВКЛЮЧАЕМ/ВЫКЛЮЧАЕМ сбор
+    кадров булевым флагом `_collecting` - БЕЗ единого вызова CoreAudio. Переходы
+    устройства (DeviceStart/DeviceStop) больше НЕ идут в горячем пути → мьютекс
+    HAL клинить нечему. Поток переоткрывается ТОЛЬКО при реальной смене/смерти
+    аудио-устройства (Bluetooth-наушники, перезапуск coreaudiod) - редко и
+    по-прежнему под потолком OP_TIMEOUT_SEC + страховкой супервайзера.
+
+    Плата: индикатор микрофона macOS (оранжевая точка) горит, пока движок
+    включён (после первой диктовки). Звук пишется ТОЛЬКО при зажатом Option -
+    вне записи колбэк кадры ОТБРАСЫВАЕТ (ничего не копится и никуда не уходит).
+    """
+
+    # ⏱ Потолок на вызов PortAudio (open/close). Норма - миллисекунды; дольше =
+    # CoreAudio HAL завис на мьютексе. Теперь достаётся РЕДКО - только при первом
+    # открытии и переоткрытии на смене устройства (не на каждую диктовку).
+    OP_TIMEOUT_SEC = 4.0
+    # Столько подряд статус-ошибок колбэка = «устройство сменилось/умерло».
+    CB_ERR_LIMIT = 5
+
+    def __init__(self, sample_rate: int = 16000, channels: int = 1, idle_release_sec: float = 0.0):
         self.sample_rate = sample_rate
         self.channels = channels
-        self._frames: list = []
         self._stream = None
-        self._recording = False
+        self._lock = threading.Lock()          # защищает кадры/флаг сбора
+        self._stream_lock = threading.Lock()   # сериализует открытие/закрытие потока (start vs idle-release)
+        self._frames: list = []
+        self._collecting = False       # копим ли кадры прямо сейчас (Option зажат)
+        self._recording = False        # логический флаг «идёт диктовка» (идемпотентность stop)
+        self._last_duration_sec = 0.0
+        self._callback_errors = 0      # подряд статус-ошибок колбэка
+        self._needs_reopen = False     # устройство «молчало» → переоткрыть
+        # Авто-отпускание микрофона по простою: поток держим открытым во время
+        # активной работы (тогда HAL не клинит), но закрываем после idle_release_sec
+        # секунд без диктовки → микрофон освобождается, оранжевая точка macOS гаснет.
+        # Следующее зажатие Option мгновенно откроет его заново. 0 = никогда не
+        # отпускать (полностью персистентный поток, точка горит всегда).
+        self.idle_release_sec = float(idle_release_sec or 0)
+        self._last_activity = 0.0
+        self._idle_watchdog_started = False
 
-    def start(self) -> None:
+    @staticmethod
+    def _run_with_timeout(fn, timeout: float, what: str) -> bool:
+        """Выполнить блокирующий PortAudio-вызов в отдельном потоке с потолком.
+        True - успел; False - завис (поток-исполнитель бросаем, он daemon).
+        Так блокировка PortAudio/CoreAudio НЕ может заклинить вызывающий поток
+        (event-tap слушателя клавиатуры) навсегда - максимум на `timeout` секунд.
+        """
+        done = threading.Event()
+        box: dict = {}
+
+        def runner():
+            try:
+                fn()
+            except Exception as e:  # noqa: BLE001 - любой сбой PortAudio не должен ронять движок
+                box["err"] = e
+            finally:
+                done.set()
+
+        threading.Thread(target=runner, daemon=True).start()
+        if not done.wait(timeout):
+            logging.warning(
+                f"AudioRecorder: {what} завис >{timeout:.0f}s - бросаю зависший "
+                f"аудиопоток (CoreAudio HAL deadlock); кадры сохраняю из памяти"
+            )
+            return False
+        if "err" in box:
+            logging.warning(f"AudioRecorder: {what} ошибка: {box['err']}")
+        return True
+
+    def _callback(self, indata, frames_n, time_info, status):
+        """Колбэк персистентного потока. Фырчит непрерывно; кадры кладём ТОЛЬКО
+        когда идёт сбор (Option зажат) - иначе просто выходим (звук отброшен)."""
+        if status:
+            logging.warning(f"audio status: {status}")
+            self._callback_errors += 1
+        if self._collecting:
+            with self._lock:
+                if self._collecting:
+                    self._frames.append(indata.copy())
+
+    def _open_stream(self) -> bool:
+        """Открыть персистентный InputStream (с потолком). True если поднят."""
         import sounddevice as sd
-        import numpy as np
 
-        self._frames = []
+        box: dict = {}
+
+        def _open():
+            s = sd.InputStream(
+                samplerate=self.sample_rate,
+                channels=self.channels,
+                dtype="float32",
+                callback=self._callback,
+            )
+            s.start()
+            box["s"] = s
+
+        ok = self._run_with_timeout(_open, self.OP_TIMEOUT_SEC, "stream.open/start")
+        if not ok or "s" not in box:
+            self._stream = None
+            return False
+        self._stream = box["s"]
+        self._callback_errors = 0
+        self._needs_reopen = False
+        self._maybe_start_idle_watchdog()
+        return True
+
+    def _maybe_start_idle_watchdog(self):
+        """Однократно запустить сторож простоя: если диктовки не было
+        idle_release_sec секунд, закрыть поток и отпустить микрофон (точка гаснет).
+        Открытие/закрытие сериализованы через _stream_lock с _ensure_stream."""
+        if self._idle_watchdog_started or self.idle_release_sec <= 0:
+            return
+        self._idle_watchdog_started = True
+        tick = min(10.0, max(2.0, self.idle_release_sec / 3.0))
+
+        def _loop():
+            while True:
+                time.sleep(tick)
+                try:
+                    s = None
+                    with self._stream_lock:
+                        if self._stream is None or self._recording or self._collecting:
+                            continue
+                        if self._last_activity and (time.time() - self._last_activity) <= self.idle_release_sec:
+                            continue
+                        s = self._stream
+                        self._stream = None  # быстро освобождаем ссылку под локом
+                    # Медленное закрытие - вне лока, под потолком (если HAL завис,
+                    # бросим daemon, ссылка уже снята; следующий start откроет заново).
+                    def _close(_s=s):
+                        try:
+                            _s.stop()
+                        except Exception:
+                            pass
+                        try:
+                            _s.close()
+                        except Exception:
+                            pass
+
+                    self._run_with_timeout(_close, self.OP_TIMEOUT_SEC, "stream.idle-release")
+                    logging.info("микрофон отпущен по простою (диктовки не было)")
+                except Exception as e:
+                    logging.warning(f"idle-release watchdog error: {e}")
+
+        threading.Thread(target=_loop, daemon=True).start()
+
+    def _ensure_stream(self) -> bool:
+        """Гарантировать живой персистентный поток. Открывает лениво (первый раз),
+        переоткрывает при смерти/смене устройства/отпускании по простою. False только
+        если открытие зависло/не удалось (HAL занят) → start_recording копит
+        audio_fail_streak, супервайзер перезапустит процесс начисто."""
+        with self._stream_lock:
+            s = self._stream
+            healthy = s is not None and not self._needs_reopen and self._callback_errors < self.CB_ERR_LIMIT
+            if healthy:
+                try:
+                    healthy = bool(s.active)
+                except Exception:
+                    healthy = False
+            if healthy:
+                return True
+            if s is not None:
+                self._stream = None
+
+                def _close_old():
+                    try:
+                        s.stop()
+                    except Exception:
+                        pass
+                    try:
+                        s.close()
+                    except Exception:
+                        pass
+
+                self._run_with_timeout(_close_old, self.OP_TIMEOUT_SEC, "stream.reopen-close")
+            return self._open_stream()
+
+    def start(self) -> bool:
+        """Начать сбор кадров. True - поток жив, пишем; False - поток не поднялся."""
+        if not self._ensure_stream():
+            self._recording = False
+            return False
+        with self._lock:
+            self._frames = []
+            self._collecting = True
+        self._last_duration_sec = 0.0
         self._recording = True
-
-        def callback(indata, frames, time_info, status):
-            if status:
-                logging.warning(f"audio status: {status}")
-            self._frames.append(indata.copy())
-
-        self._stream = sd.InputStream(
-            samplerate=self.sample_rate,
-            channels=self.channels,
-            dtype="float32",
-            callback=callback,
-        )
-        self._stream.start()
+        self._last_activity = time.time()
+        return True
 
     def stop(self) -> Optional[str]:
-        """Остановить запись и сохранить в WAV. Вернуть путь к файлу."""
+        """Остановить сбор и сохранить в WAV. Поток НЕ закрываем - он персистентный
+        (в этом весь фикс). Идемпотентно: если запись не шла - None."""
         import numpy as np
         import soundfile as sf
 
-        if not self._recording or not self._stream:
+        if not self._recording:
             return None
         self._recording = False
-        self._stream.stop()
-        self._stream.close()
-        self._stream = None
+        self._last_activity = time.time()
+        with self._lock:
+            self._collecting = False
+            frames = self._frames
+            self._frames = []
 
-        if not self._frames:
+        if not frames:
+            self._last_duration_sec = 0.0
+            self._needs_reopen = True
             return None
-        audio = np.concatenate(self._frames, axis=0)
+        audio = np.concatenate(frames, axis=0)
+        self._last_duration_sec = audio.shape[0] / self.sample_rate
+        self._callback_errors = 0
 
         tmp = tempfile.NamedTemporaryFile(
             suffix=".wav", delete=False, prefix="voice_dictation_"
@@ -284,11 +473,33 @@ class AudioRecorder:
 
     @property
     def duration_sec(self) -> float:
-        if not self._frames:
-            return 0.0
-        import numpy as np
-        total_samples = sum(f.shape[0] for f in self._frames)
-        return total_samples / self.sample_rate
+        # После stop() кадры очищены - длительность последней записи сохранена.
+        with self._lock:
+            if self._frames:
+                total_samples = sum(f.shape[0] for f in self._frames)
+                return total_samples / self.sample_rate
+        return self._last_duration_sec
+
+    def close(self) -> None:
+        """Закрыть поток начисто (на выходе движка). Best-effort под потолком."""
+        s = self._stream
+        self._stream = None
+        self._collecting = False
+        self._recording = False
+        if s is None:
+            return
+
+        def _close():
+            try:
+                s.stop()
+            except Exception:
+                pass
+            try:
+                s.close()
+            except Exception:
+                pass
+
+        self._run_with_timeout(_close, self.OP_TIMEOUT_SEC, "stream.close(shutdown)")
 
 
 # ─── Text insertion ─────────────────────────────────────────────────────────
@@ -435,7 +646,7 @@ def save_clipboard() -> Optional[str]:
     """Снимок текстового содержимого буфера для последующего восстановления.
 
     None если буфер пуст / содержит не-текст (картинку, файл) / не удалось
-    прочитать. В этих случаях restore тоже no-op — мы не пытаемся
+    прочитать. В этих случаях restore тоже no-op - мы не пытаемся
     восстановить то, что не сохранили.
     """
     text = _get_clipboard_text()
@@ -447,7 +658,7 @@ def save_clipboard() -> Optional[str]:
 def restore_clipboard(saved: Optional[str]) -> None:
     """Положить сохранённое содержимое обратно с verify-and-retry.
 
-    После записи читаем буфер и сравниваем; если не совпало — повторяем
+    После записи читаем буфер и сравниваем; если не совпало - повторяем
     до 3 попыток. Защита от того, что в момент нашей записи буфер был
     занят другим процессом (Win+V history listener, clipboard manager).
     """
@@ -472,8 +683,8 @@ def restore_clipboard_deferred(saved: Optional[str], delay_sec: float = 1.0) -> 
     Ctrl+V асинхронно: сначала помещает WM_PASTE в очередь, обработчик
     читает буфер в свою очередь. На медленных таргетах (Chrome,
     Electron, web-приложения вроде ChatGPT/Claude) между нашим SendInput
-    и реальным чтением буфера может пройти 200–800 мс. Если восстановить
-    буфер слишком быстро — приложение прочитает уже восстановленный
+    и реальным чтением буфера может пройти 200-800 мс. Если восстановить
+    буфер слишком быстро - приложение прочитает уже восстановленный
     оригинал, а не диктованный текст. delay_sec=1.0 покрывает медленные
     таргеты с запасом.
     """
@@ -506,7 +717,7 @@ def _windows_paste() -> None:
         "lwin": 0x5B, "rwin": 0x5C,
         "v": 0x56,
     }
-    # 1) Release any held modifiers (idempotent — release of unpressed key is no-op)
+    # 1) Release any held modifiers (idempotent - release of unpressed key is no-op)
     for name in ("lctrl", "rctrl", "ctrl", "lalt", "ralt", "alt",
                  "lshift", "rshift", "shift", "lwin", "rwin"):
         user32.keybd_event(VK[name], 0, KEYEVENTF_KEYUP, 0)
@@ -520,7 +731,7 @@ def _windows_paste() -> None:
 
 
 def _paste_debug(msg: str) -> None:
-    """Записать, КАКОЙ способ вставки сработал — для диагностики (читаю файл)."""
+    """Записать, КАКОЙ способ вставки сработал - для диагностики (читаю файл)."""
     # По умолчанию диагностику на диск НЕ пишем (приватность). Включается только
     # явным DICTATION_DEBUG=1 для отладки. Без него - ничего не оседает.
     if not os.environ.get("DICTATION_DEBUG"):
@@ -537,7 +748,7 @@ def paste_from_clipboard() -> None:
     """Симулировать Cmd+V (Mac) или Ctrl+V (Linux/Win). Пишет диагностику в paste_debug.log."""
     # macOS: сначала Quartz Cmd+V с ЯВНЫМ флагом Command, потом pynput, потом System Events.
     if platform.system() == "Darwin":
-        # 0) Quartz Cmd+V с явным флагом Command — НАДЁЖНЫЙ путь.
+        # 0) Quartz Cmd+V с явным флагом Command - НАДЁЖНЫЙ путь.
         #    pynput в этой версии НЕ применяет модификатор Command к 'v' → синтетический
         #    Cmd+V не срабатывал (текст копировался в буфер, в логе «Вставлено», но вставки
         #    не было). Прямой CGEvent с kCGEventFlagMaskCommand на 'v' (keycode 9) вставляет
@@ -554,7 +765,7 @@ def paste_from_clipboard() -> None:
         except Exception as e:
             _paste_debug(f"quartz: EXC {e}")
 
-        # 1) pynput Cmd+V — запасной (в этой версии модификатор может не применяться).
+        # 1) pynput Cmd+V - запасной (в этой версии модификатор может не применяться).
         try:
             from pynput.keyboard import Controller, Key
             kb = Controller()
@@ -599,7 +810,7 @@ def paste_from_clipboard() -> None:
     except Exception as e:
         logging.error(
             f"paste simulation failed: {e}\n"
-            f"Текст в clipboard — вставь вручную через Cmd+V/Ctrl+V."
+            f"Текст в clipboard - вставь вручную через Cmd+V/Ctrl+V."
         )
 
 
@@ -607,7 +818,7 @@ def play_beep(frequency: int = 800, duration_ms: int = 80) -> None:
     """Короткий синтезированный бип через sounddevice. Сохранён для
     обратной совместимости и для платформ без winsound (Linux/macOS).
 
-    На Windows предпочитай play_beep_system — он громче, гарантированно
+    На Windows предпочитай play_beep_system - он громче, гарантированно
     слышен и не конфликтует с активным sd.InputStream (запись микрофона).
     """
     try:
@@ -635,7 +846,7 @@ def _make_dual_beep_wav(
 
     Возвращает байты PCM-WAV пригодные для winsound.PlaySound(SND_MEMORY).
 
-    tail_silence_ms — хвост тишины после второго тона. Нужен потому, что
+    tail_silence_ms - хвост тишины после второго тона. Нужен потому, что
     Windows audio mixer иногда обрезает последние ~30-50ms короткого WAV
     (артефакт буферизации). Просто добавляем «зазор» из нулей.
     """
@@ -644,7 +855,7 @@ def _make_dual_beep_wav(
 
     def _tone_samples(freq: int, dur_ms: int) -> list:
         n = int(sample_rate * dur_ms / 1000)
-        fade_n = max(1, int(sample_rate * 0.015))  # 15ms fade — длинный ramp убирает крякание BT-кодеков на attack
+        fade_n = max(1, int(sample_rate * 0.015))  # 15ms fade - длинный ramp убирает крякание BT-кодеков на attack
         out = []
         two_pi_f = 2.0 * _m.pi * freq
         for i in range(n):
@@ -680,7 +891,7 @@ def _make_single_beep_wav(
     sample_rate: int = 22050, vol: float = 0.01,
     fade_ms: int = 10, tail_silence_ms: int = 80,
 ) -> bytes:
-    """Однотоновый WAV. Мягкий, не сливается с речью — для стоп-сигнала."""
+    """Однотоновый WAV. Мягкий, не сливается с речью - для стоп-сигнала."""
     import math as _m
     import struct
 
@@ -708,7 +919,7 @@ def _make_single_beep_wav(
     return riff + fmt_chunk + data_chunk
 
 
-# Pre-render the two beep WAVs once at import time — playing them later
+# Pre-render the two beep WAVs once at import time - playing them later
 # is then just a fire-and-forget winsound call.
 _BEEP_WAV_START: Optional[bytes] = None
 _BEEP_WAV_STOP: Optional[bytes] = None
@@ -733,7 +944,7 @@ def _play_wav_bytes(wav: bytes) -> None:
 def _mac_play_sound(name: str) -> None:
     """Громко и надёжно проиграть системный звук macOS через afplay.
 
-    На Mac sounddevice/winsound для коротких бипов не звучали (winsound — только
+    На Mac sounddevice/winsound для коротких бипов не звучали (winsound - только
     Windows). Системные звуки /System/Library/Sounds/*.aiff слышно всегда.
     Fire-and-forget: не блокирует и не конфликтует с записью микрофона.
     """
@@ -748,7 +959,7 @@ def _mac_play_sound(name: str) -> None:
 
 def play_start_beep() -> None:
     if platform.system() == "Darwin":
-        _mac_play_sound("Tink")          # «слушаю» — запись началась
+        _mac_play_sound("Tink")          # «слушаю» - запись началась
         return
     if _BEEP_WAV_START is not None:
         _play_wav_bytes(_BEEP_WAV_START)
@@ -756,14 +967,14 @@ def play_start_beep() -> None:
 
 def play_stop_beep() -> None:
     if platform.system() == "Darwin":
-        _mac_play_sound("Pop")           # «распознаю» — запись окончена
+        _mac_play_sound("Pop")           # «распознаю» - запись окончена
         return
     if _BEEP_WAV_STOP is not None:
         _play_wav_bytes(_BEEP_WAV_STOP)
 
 
 def play_success_beep() -> None:
-    """Сигнал «текст вставлен» — чтобы было слышно, что диктовка дошла."""
+    """Сигнал «текст вставлен» - чтобы было слышно, что диктовка дошла."""
     if platform.system() == "Darwin":
         _mac_play_sound("Glass")
         return
@@ -772,14 +983,14 @@ def play_success_beep() -> None:
 
 
 def play_empty_beep() -> None:
-    """Сигнал «не расслышал» — тихо/пусто, ничего не вставлено."""
+    """Сигнал «не расслышал» - тихо/пусто, ничего не вставлено."""
     if platform.system() == "Darwin":
         _mac_play_sound("Funk")
         return
 
 
 def play_dual_beep(f1: int, f2: int, dur_ms: int = 60, gap_ms: int = 40) -> None:
-    """Двутоновый бип на произвольных частотах. Синтезирует WAV каждый раз —
+    """Двутоновый бип на произвольных частотах. Синтезирует WAV каждый раз -
     использовать только для редких/нестандартных тонов; для обычных
     старт/стоп есть play_start_beep / play_stop_beep с предрендеренным WAV.
     """
@@ -811,7 +1022,7 @@ class TrayIcon:
     def start(self, current_model: Optional[str] = None,
               available_models: Optional[list] = None,
               on_select_model=None):
-        """current_model / available_models / on_select_model — для подменю
+        """current_model / available_models / on_select_model - для подменю
         "Модель". on_select_model(name) вызывается при клике; обычно делает
         write_config + restart_self()."""
         try:
@@ -857,8 +1068,8 @@ class TrayIcon:
         from PIL import Image, ImageDraw
 
         size = 64
-        # Базовая иконка — assets/icon.png рядом с репо. Если её нет
-        # (минимальная установка) — fallback на серый круг.
+        # Базовая иконка - assets/icon.png рядом с репо. Если её нет
+        # (минимальная установка) - fallback на серый круг.
         repo_root = Path(__file__).resolve().parents[1]
         icon_path = repo_root / "assets" / "icon.png"
         if icon_path.exists():
@@ -873,7 +1084,7 @@ class TrayIcon:
             if color is not None:
                 d = ImageDraw.Draw(img)
                 # Точка-индикатор поверх встроенной красной точки логотипа
-                # (правый нижний угол) — повторяет позицию dot'а возле курсора.
+                # (правый нижний угол) - повторяет позицию dot'а возле курсора.
                 d.ellipse((size - 26, size - 26, size - 4, size - 4),
                           fill=color, outline="white", width=2)
             return img
@@ -896,15 +1107,15 @@ class TrayIcon:
 
 
 def _warmup(transcribe_fn, cfg: dict, tray) -> None:
-    """Прогрев модели в фоне — компилирует OV-граф / прогружает веса.
+    """Прогрев модели в фоне - компилирует OV-граф / прогружает веса.
 
-    Без warmup'а первый Ctrl+Alt тратит 5–30 сек на cold start (особенно
+    Без warmup'а первый Ctrl+Alt тратит 5-30 сек на cold start (особенно
     на OpenVINO + iGPU при первом compile=True). Запись на короткий буфер
     тишины, результат игнорируем.
     """
     try:
         import wave
-        # 0.5 сек тишины 16k mono int16 — минимум, который не отлетает по VAD
+        # 0.5 сек тишины 16k mono int16 - минимум, который не отлетает по VAD
         sample_rate = 16000
         silence = b"\x00\x00" * (sample_rate // 2)
         tmp = Path(tempfile.gettempdir()) / "whisper_skill_warmup.wav"
@@ -925,7 +1136,7 @@ def _warmup(transcribe_fn, cfg: dict, tray) -> None:
         )
         logging.info(f"warmup done in {time.time() - t0:.1f}s")
     except Exception as e:
-        # Прогрев — best-effort. Если упал, обычная диктовка продолжит работать
+        # Прогрев - best-effort. Если упал, обычная диктовка продолжит работать
         # как раньше: просто первый запрос будет холодным.
         logging.info(f"warmup failed (non-fatal): {e}")
 
@@ -935,12 +1146,15 @@ class State:
     is_recording: bool = False
     is_transcribing: bool = False
     last_dictation_at: float = 0.0  # time.time() последней успешной вставки
+    recording_started_at: float = 0.0  # time.time() старта текущей записи (для сторожа потерянного отпускания)
+    transcribing_started_at: float = 0.0  # time.time() старта распознавания (для сторожа зависшего transcribe)
     target_bundle: Optional[str] = None  # bundle id окна, куда вставлять (захвачен на старте записи)
+    audio_fail_streak: int = 0  # подряд неудавшихся стартов записи (HAL завис) - читает супервайзер
 
 
 def _frontmost_bundle_id() -> Optional[str]:
     """Bundle id активного приложения (macOS). Нужно, чтобы вернуть фокус туда
-    перед вставкой — иначе Cmd+V уходит в окно Терминала, а не в чат."""
+    перед вставкой - иначе Cmd+V уходит в окно Терминала, а не в чат."""
     if platform.system() != "Darwin":
         return None
     try:
@@ -968,12 +1182,41 @@ def _activate_bundle(bundle_id: str) -> None:
         pass
 
 
+def _reaper_decision(is_recording: bool, held: float, up_ticks: int,
+                     has_keystate: bool, max_sec: float, min_held: float = 0.4) -> str:
+    """Чистое решение сторожа «потерянного отпускания» Option (тестируемо отдельно).
+
+    Возвращает:
+      'none'     - ничего не делать;
+      'finalize' - завершить запись и распознать (Option физически отпущен, а
+                   is_recording завис → событие отпускания потеряно);
+      'reset'    - сбросить залипшую запись без вставки (резерв по потолку длительности).
+
+    up_ticks - сколько тиков ПОДРЯД Option читается физически отпущенным (дебаунс от глюка).
+    has_keystate - доступно ли HID-чтение состояния клавиши (CGEventSourceKeyState).
+    """
+    if not is_recording or held < min_held:
+        return "none"
+    if has_keystate:
+        # Состояние клавиши известно.
+        if up_ticks >= 2:
+            return "finalize"   # Option отпущен ≥2 тика → отпускание потеряно, забираем речь
+        if held > max_sec:
+            return "finalize"   # держат дольше потолка, клавиша физически вниз → длинная речь, забираем
+        return "none"
+    # HID-чтение недоступно: судим только по времени. Не знаем, речь это или
+    # 90с фона после потерянного отпускания → НЕ вставляем «простыню», сбрасываем.
+    if held > max_sec:
+        return "reset"
+    return "none"
+
+
 def main_loop(cfg: dict, cfg_path: Path):
     from pynput import keyboard
 
     # --- macOS: держим перехват клавиш живым (фикс «оглох после паузы/сна/блокировки») ---
     # pynput в этой версии НЕ переподнимает CGEventTap, когда macOS его отключает
-    # (по таймауту или после сна экрана/блокировки) — поток жив, рунлуп крутится, но
+    # (по таймауту или после сна экрана/блокировки) - поток жив, рунлуп крутится, но
     # перехват выключен, и хоткей перестаёт ловиться. Сохраняем созданный tap и
     # периодически включаем его заново сторожем-потоком. Включение живого tap = no-op.
     _tap_keepalive = {"enable": None}
@@ -1017,7 +1260,10 @@ def main_loop(cfg: dict, cfg_path: Path):
 
     state = State()
     state_lock = threading.Lock()
-    recorder = AudioRecorder(cfg["sample_rate"], cfg["channels"])
+    recorder = AudioRecorder(
+        cfg["sample_rate"], cfg["channels"],
+        idle_release_sec=cfg.get("idle_release_sec", 180),
+    )
 
     # macOS low-CPU mode: pystray в фоне и Tk у нас вызывают серьёзный
     # idle-CPU на маке (наблюдалось ~90% на M-чипе). Дефолтно отключаем оба
@@ -1030,7 +1276,7 @@ def main_loop(cfg: dict, cfg_path: Path):
         if cfg.get("show_tray") or cfg.get("show_cursor_indicator"):
             logging.info(
                 "macOS: tray и cursor_indicator отключены ради экономии CPU. "
-                "Чтобы включить — поставь mac_low_cpu_mode: false в конфиге."
+                "Чтобы включить - поставь mac_low_cpu_mode: false в конфиге."
             )
 
     def _on_select_model(new_model: str):
@@ -1058,10 +1304,10 @@ def main_loop(cfg: dict, cfg_path: Path):
 
     # Прогрев модели в фоне: первый hotkey-press не должен ждать
     # компиляцию OpenVINO-графа / загрузку весов faster-whisper.
-    # Event сигнализирует завершение warmup'а — work() ждёт его перед
+    # Event сигнализирует завершение warmup'а - work() ждёт его перед
     # первым transcribe. Это решает две проблемы одним механизмом:
     #   1) Cold start первой диктовки: без ожидания первый hotkey ловил
-    #      холодную модель + компиляцию OV-графа (5–30с задержка).
+    #      холодную модель + компиляцию OV-графа (5-30с задержка).
     #   2) Race на module import: warmup-thread и work-thread параллельно
     #      делают `from optimum.intel import OVModelForSpeechSeq2Seq`.
     #      transformers._LazyModule под Python 3.12 даёт partially-initialized
@@ -1073,9 +1319,9 @@ def main_loop(cfg: dict, cfg_path: Path):
             try:
                 _warmup(transcribe, cfg, tray)
             finally:
-                # set даже на failure — иначе work() заблокируется навсегда.
+                # set даже на failure - иначе work() заблокируется навсегда.
                 # Если warmup упал, первый transcribe сам потерпит cold start
-                # — это лучше чем deadlock.
+                # - это лучше чем deadlock.
                 warmup_done.set()
 
         threading.Thread(target=_warmup_then_signal, daemon=True).start()
@@ -1083,8 +1329,8 @@ def main_loop(cfg: dict, cfg_path: Path):
         warmup_done.set()
 
     # Cursor indicator (small blinking dot near the mouse cursor while recording).
-    # Optional — silently disables if Tk unavailable. На macOS всегда no-op
-    # (см. scripts/cursor_indicator.py — Tk thread-safety issue).
+    # Optional - silently disables if Tk unavailable. На macOS всегда no-op
+    # (см. scripts/cursor_indicator.py - Tk thread-safety issue).
     cursor_ind = None
     if cfg.get("show_cursor_indicator", True) and not is_mac_low_cpu:
         try:
@@ -1100,6 +1346,7 @@ def main_loop(cfg: dict, cfg_path: Path):
             if state.is_recording or state.is_transcribing:
                 return
             state.is_recording = True
+            state.recording_started_at = time.time()
         tray.set_state("recording")
         # Запомнить окно, в котором пользователь сейчас работает (куда вставлять).
         # В фоне, чтобы не задерживать старт записи. Перед вставкой вернём фокус сюда.
@@ -1112,11 +1359,25 @@ def main_loop(cfg: dict, cfg_path: Path):
         if cfg.get("play_sound"):
             threading.Thread(target=play_start_beep, daemon=True).start()
         try:
-            recorder.start()
-            print("🎙  Recording... (release hotkey to transcribe)")
+            ok = recorder.start()
         except Exception as e:
             print(f"❌ Recording failed: {e}")
-            state.is_recording = False
+            ok = False
+        if ok:
+            with state_lock:
+                state.audio_fail_streak = 0
+            print("🎙  Recording... (release hotkey to transcribe)")
+        else:
+            # Открытие потока зависло/не удалось (аудио-устройство занято или
+            # CoreAudio HAL завис). Движок остаётся живым и слышащим - просто
+            # сбрасываем состояние, владелец жмёт Option заново. Копим счётчик
+            # подряд-неудач: супервайзер по нему поймёт «HAL застрял насовсем»
+            # и перезапустит процесс начисто (свежее соединение с CoreAudio).
+            with state_lock:
+                state.is_recording = False
+                state.audio_fail_streak += 1
+                streak = state.audio_fail_streak
+            print(f"❌ Не удалось начать запись (аудио занято, подряд: {streak}) - отпусти и нажми Option ещё раз")
             tray.set_state("idle")
             if cursor_ind:
                 cursor_ind.hide()
@@ -1156,7 +1417,9 @@ def main_loop(cfg: dict, cfg_path: Path):
             return
 
         print(f"⏳ Transcribing {duration_ms:.0f}ms of audio...")
-        state.is_transcribing = True
+        with state_lock:
+            state.is_transcribing = True
+            state.transcribing_started_at = time.time()
 
         def work():
             try:
@@ -1183,8 +1446,8 @@ def main_loop(cfg: dict, cfg_path: Path):
                     # только факт и длину. Распознанный текст (пароли, личное)
                     # на диск не попадает.
                     print(f"✓ распознано за {elapsed:.1f}s ({len(text)} симв.)")
-                    # Если предыдущая диктовка была недавно — начинаем
-                    # новую с переноса строки. Порог 30s — «продолжаем
+                    # Если предыдущая диктовка была недавно - начинаем
+                    # новую с переноса строки. Порог 30s - «продолжаем
                     # в то же место»; после большой паузы вставка чистая.
                     newline_threshold_s = cfg.get("newline_after_dictation_within_sec", 30.0)
                     now = time.time()
@@ -1261,12 +1524,12 @@ def main_loop(cfg: dict, cfg_path: Path):
         # рунлуп виснет после сна) → движок «глохнет», хотя процесс жив; переподнять
         # старый CGEventTap уже бесполезно (рунлуп его не качает). Лечим ПЕРЕСОЗДАНИЕМ
         # слушателя: новый Listener = новый tap + новый рунлуп. Триггеры пересоздания:
-        #   (а) поток слушателя умер (is_alive() == False — pynput при этом НЕ сбрасывает
+        #   (а) поток слушателя умер (is_alive() == False - pynput при этом НЕ сбрасывает
         #       running, поэтому проверяем именно is_alive());
         #   (б) между тиками сторожа большой провал по часам = Mac спал (даже если поток
         #       ещё жив, после сна tap событий не качает).
         # При пересоздании чистим залипшее состояние: после сна остаётся is_recording=True
-        # (потерянное «отпускание» Option) и «зажатый» хоткей — иначе движок «глух».
+        # (потерянное «отпускание» Option) и «зажатый» хоткей - иначе движок «глух».
         def _reset_stuck_state(reason):
             try:
                 currently_pressed.clear()
@@ -1278,9 +1541,135 @@ def main_loop(cfg: dict, cfg_path: Path):
                         except Exception:
                             pass
                 logging.info(f"hearing revived ({reason}); stuck state reset")
-                print(f"♻️  Слух перезапущен ({reason}) — снова слушаю Option")
+                print(f"♻️  Слух перезапущен ({reason}) - снова слушаю Option")
             except Exception as e:
                 logging.warning(f"reset stuck state failed: {e}")
+
+        # ─── Сторож «потерянного отпускания» Option (главный фикс стабильности) ───
+        # Третий режим отказа, НЕ покрытый супервайзером выше: event tap иногда
+        # роняет именно событие ОТПУСКАНИЯ Option во время удержания (tap-таймаут
+        # ровно в момент жеста, перехват фокуса, hiccup). Тогда on_release не
+        # приходит, is_recording залипает True, и start_recording() глушит ВСЕ новые
+        # записи ранним return - движок «оглох», хотя процесс жив и tap воскрешён
+        # вотчдогом. Раньше лечилось только ручным перезапуском (кнопкой).
+        # Лечим БЕЗ догадок «почему»: раз в секунду спрашиваем у macOS, ФИЗИЧЕСКИ ли
+        # ещё зажат Option (CGEventSourceKeyState по HID). Если клавиша уже отпущена,
+        # а мы всё «пишем» - отпускание потеряно: завершаем запись сами (надиктованное
+        # восстановится). Дебаунс в 2 тика гасит одиночный глюк чтения. Потолок
+        # max_record_sec - резерв, когда HID-чтение недоступно (там сбрасываем без вставки).
+        def _lost_release_reaper():
+            try:
+                from Quartz import (
+                    CGEventSourceKeyState,
+                    kCGEventSourceStateCombinedSessionState as _SRC,
+                )
+            except Exception as e:
+                CGEventSourceKeyState = None
+                _SRC = None
+                logging.warning(f"lost-release reaper: Quartz keystate недоступен ({e}); работает только потолок")
+            OPTION_KEYCODES = (58, 61)  # левый/правый Option
+            has_keystate = CGEventSourceKeyState is not None
+            max_sec = float(cfg.get("max_record_sec", 90) or 90)
+            # Потолок на распознавание: gigaam на CPU ~30x realtime (90с речи → ~3с),
+            # плюс запас на холодный warmup модели (~30с на первой диктовке). 120с
+            # заведомо больше любого честного распознавания, но ловит ВЕЧНОЕ
+            # зависание transcribe(), из-за которого флаг is_transcribing залипал бы
+            # True и блокировал ВСЕ будущие диктовки (start_recording делает ранний
+            # return при is_transcribing). Heartbeat при таком зависании продолжает
+            # тикать, поэтому супервайзер его НЕ ловит - лечим только здесь.
+            transcribe_stuck_sec = float(cfg.get("transcribe_stuck_sec", 120) or 120)
+            up_ticks = 0
+            while True:
+                time.sleep(1.0)
+                try:
+                    # ─── Сторож зависшего распознавания (независим от записи) ───
+                    with state_lock:
+                        tr = state.is_transcribing
+                        tr_started = state.transcribing_started_at
+                    if tr and tr_started and (time.time() - tr_started) > transcribe_stuck_sec:
+                        logging.warning(
+                            f"transcribe-reaper: распознавание висит "
+                            f">{transcribe_stuck_sec:.0f}s - сбрасываю is_transcribing "
+                            f"(зависший поток - daemon, умрёт сам), диктовка снова доступна"
+                        )
+                        print("♻️  Распознавание зависло - сбрасываю, диктуй заново")
+                        with state_lock:
+                            state.is_transcribing = False
+                        tray.set_state("idle")
+                        if cursor_ind:
+                            cursor_ind.hide()
+
+                    with state_lock:
+                        rec = state.is_recording
+                        started = state.recording_started_at
+                    if not rec or not started:
+                        up_ticks = 0
+                        continue
+                    held = time.time() - started
+                    if has_keystate:
+                        phys_up = not any(
+                            CGEventSourceKeyState(_SRC, kc) for kc in OPTION_KEYCODES
+                        )
+                        up_ticks = up_ticks + 1 if phys_up else 0
+                    decision = _reaper_decision(rec, held, up_ticks, has_keystate, max_sec)
+                    if decision == "finalize":
+                        logging.warning(
+                            f"lost-release reaper: Option отпущен/потолок, is_recording завис "
+                            f"(удержание {held:.1f}s) - завершаю запись сам"
+                        )
+                        print("♻️  Поймал потерянное отпускание Option - завершаю запись сам")
+                        up_ticks = 0
+                        currently_pressed.clear()
+                        stop_and_transcribe()  # идемпотентно: под локом проверит is_recording
+                    elif decision == "reset":
+                        logging.warning(
+                            f"lost-release reaper: запись висит >{max_sec:.0f}s - сброс залипшего состояния"
+                        )
+                        print(f"♻️  Запись висела дольше {max_sec:.0f}с - сбрасываю (надиктуй заново)")
+                        up_ticks = 0
+                        currently_pressed.clear()
+                        _reset_stuck_state("потолок длительности записи")
+                except Exception as e:
+                    logging.warning(f"lost-release reaper error: {e}")
+
+        threading.Thread(target=_lost_release_reaper, daemon=True).start()
+
+        # ─── Пульс здоровья для внешнего супервайзера (последний рубеж) ──────
+        # Раз в 2с пишем health.json: метку времени (доказывает, что Python жив и
+        # GIL не заклинен) + PID + текущее аудио-состояние. Внешний супервайзер
+        # читает этот файл и, если пульс «застыл» или процесс упал, перезапускает
+        # движок. Это страховка от отказов, которые НЕЛЬЗЯ вылечить изнутри
+        # процесса (нативный дедлок CoreAudio, краш интерпретатора). Обычные
+        # «оглохи» по-прежнему лечат три сторожа выше + потолок PortAudio в
+        # AudioRecorder - до супервайзера дело доходит редко.
+        health_path = Path.home() / ".config" / "whisper-skill" / "health.json"
+
+        def _heartbeat():
+            import json as _json
+            pid = os.getpid()
+            try:
+                health_path.parent.mkdir(parents=True, exist_ok=True)
+            except Exception:
+                pass
+            while True:
+                try:
+                    with state_lock:
+                        rec = state.is_recording
+                        tr = state.is_transcribing
+                        fail_streak = state.audio_fail_streak
+                    op = "recording" if rec else ("transcribing" if tr else "idle")
+                    tmp = str(health_path) + ".tmp"
+                    with open(tmp, "w") as fh:
+                        _json.dump({
+                            "ts": time.time(), "pid": pid,
+                            "audio_op": op, "audio_fail_streak": fail_streak,
+                        }, fh)
+                    os.replace(tmp, str(health_path))
+                except Exception as e:
+                    logging.warning(f"heartbeat write failed: {e}")
+                time.sleep(2.0)
+
+        threading.Thread(target=_heartbeat, daemon=True).start()
 
         first = True
         while True:
@@ -1303,7 +1692,7 @@ def main_loop(cfg: dict, cfg_path: Path):
                     last_tick = now
                     if gap > 8.0:
                         # провал по часам >> 2с = Mac спал → tap оглох, пересоздаём
-                        logging.info(f"sleep gap {gap:.0f}s detected — recreating listener")
+                        logging.info(f"sleep gap {gap:.0f}s detected - recreating listener")
                         break
             except KeyboardInterrupt:
                 try:
@@ -1370,7 +1759,7 @@ def _attach_log_file(log_path: str, verbose: bool) -> None:
     """Перенаправить stdout/stderr/logging в файл.
 
     Нужен и для отладки (видно что транскрибируется), и чтобы под pythonw.exe
-    (autostart) print() не падал молча — там sys.stdout/sys.stderr = None.
+    (autostart) print() не падал молча - там sys.stdout/sys.stderr = None.
     """
     expanded = os.path.expandvars(os.path.expanduser(log_path))
     Path(expanded).parent.mkdir(parents=True, exist_ok=True)
@@ -1421,10 +1810,10 @@ def main():
         )
 
     # Single-instance: вторая копия (autostart + ярлык, или ручной запуск
-    # поверх работающей) выходит тихо. Retry — на случай self-restart при
+    # поверх работающей) выходит тихо. Retry - на случай self-restart при
     # переключении модели через tray-меню.
     if not acquire_single_instance_lock(timeout_seconds=2.0):
-        logging.info("Another voice_dictation instance is already running — exiting silently.")
+        logging.info("Another voice_dictation instance is already running - exiting silently.")
         return 0
 
     # Fast mode for dictation: greedy decoding, no temperature fallback
@@ -1450,7 +1839,7 @@ def main():
         try:
             __import__("tkinter")
         except ImportError:
-            print("⚠ tkinter не найден — cursor_indicator не будет работать.", file=sys.stderr)
+            print("⚠ tkinter не найден - cursor_indicator не будет работать.", file=sys.stderr)
             print("  Mac:    brew install python-tk@3.12", file=sys.stderr)
             print("  Linux:  sudo apt install python3-tk", file=sys.stderr)
             print("  Windows: переустанови Python и отметь 'tcl/tk and IDLE'", file=sys.stderr)
@@ -1461,7 +1850,7 @@ def main():
         print(f"  pip install {' '.join(missing)} pystray Pillow")
         return 1
 
-    # macOS Accessibility check — без него глобальный hotkey не сработает,
+    # macOS Accessibility check - без него глобальный hotkey не сработает,
     # но pynput даёт только WARNING в stderr и не падает. Пользователь
     # думает что всё сломано. Явно проверяем + открываем системные настройки.
     if platform.system() == "Darwin":
@@ -1475,7 +1864,7 @@ def _check_macos_accessibility() -> bool:
     """Проверить что процессу выдан Accessibility-permission на macOS.
 
     Использует CoreFoundation/ApplicationServices через ctypes. Если
-    permission не выдан — печатает чёткую инструкцию и автоматически
+    permission не выдан - печатает чёткую инструкцию и автоматически
     открывает соответствующий раздел System Settings. Возвращает False
     если permission не выдан (caller должен exit'нуть с этим кодом).
     """
@@ -1492,7 +1881,7 @@ def _check_macos_accessibility() -> bool:
         ApplicationServices.AXIsProcessTrusted.restype = c_bool
         trusted = ApplicationServices.AXIsProcessTrusted()
     except Exception as e:
-        # Если не удалось проверить — не блокируем запуск (пусть pynput сам разберётся)
+        # Если не удалось проверить - не блокируем запуск (пусть pynput сам разберётся)
         logging.debug(f"AX trust check failed: {e}")
         return True
 

@@ -23,8 +23,14 @@ step(){ echo; echo ">>> $1"; }
 step "Шаг 1 из 5: копирую программу"
 mkdir -p "$DEST" "$CFGDIR" "$HFHUB"
 cp -R "$HERE/src/." "$DEST/"
-cp "$HERE/config/voice_dictation.json" "$CFGDIR/voice_dictation.json"
-echo "ок"
+# Конфиг - ТОЛЬКО если его ещё нет: повторный запуск установщика = обновление,
+# оно не должно затирать настройки человека (клавишу и пр.).
+if [ ! -f "$CFGDIR/voice_dictation.json" ]; then
+  cp "$HERE/config/voice_dictation.json" "$CFGDIR/voice_dictation.json"
+  echo "ок"
+else
+  echo "ок (настройки уже есть - не трогаю)"
+fi
 
 # --- 2. модель (офлайн из пакета, иначе кэш, иначе скачать) ---
 step "Шаг 2 из 5: голосовой движок (модель)"
@@ -35,7 +41,9 @@ if [ -d "$HERE/model/models--istupakov--gigaam-v3-onnx" ]; then
 elif [ -d "$HFHUB/models--istupakov--gigaam-v3-onnx" ]; then
   echo "ок (модель уже есть в кэше)"
 else
-  echo "модели в пакете нет - скачаю при первом запуске (нужен интернет один раз)."
+  echo "❌ Модели в пакете нет. Это неполная копия (например, git clone без архива)."
+  echo "   Возьмите ПОЛНЫЙ архив из раздела Releases - в нём вшита модель распознавания."
+  read -p "Enter чтобы закрыть..."; exit 1
 fi
 
 # --- 3. uv + Python 3.11 (закреплённая версия uv + проверка контрольной суммы) ---
@@ -76,11 +84,13 @@ cp "$HERE/launchers/Диктовка ГигаАМ - проверить.command" 
 
 cat > "$DESK/Диктовка ГигаАМ - удалить.command" <<'DEL'
 #!/bin/bash
+pkill -f "examples.supervisor" 2>/dev/null; sleep 1
 pkill -f "examples.voice_dictation" 2>/dev/null
 rm -rf "$HOME/.gigaam-dictation"
 rm -rf "$HOME/.config/whisper-skill"
+rm -rf "$HOME/.cache/huggingface/hub/models--istupakov--gigaam-v3-onnx"
 rm -f "$HOME/Desktop/Диктовка ГигаАМ - включить.command" "$HOME/Desktop/Диктовка ГигаАМ - выключить.command" "$HOME/Desktop/Диктовка ГигаАМ - проверить.command"
-echo "Диктовка удалена. (Разрешения «Терминала» можешь убрать в Системных настройках вручную.)"
+echo "Диктовка и модель распознавания удалены. (Разрешения «Терминала» можешь убрать в Системных настройках вручную.)"
 echo "Эту кнопку «удалить» можно теперь тоже стереть в корзину."
 sleep 2
 DEL

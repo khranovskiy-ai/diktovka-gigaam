@@ -38,15 +38,29 @@ import time
 from pathlib import Path
 
 # ─── Пути и настройки ────────────────────────────────────────────────────────
+IS_WIN = os.name == "nt"
+
 DEST = Path.home() / ".gigaam-dictation"
-VPY = DEST / ".venv" / "bin" / "python"
+if IS_WIN:
+    # pythonw.exe = без консольного окна (фон); python.exe - запасной.
+    VPY = DEST / ".venv" / "Scripts" / "pythonw.exe"
+    if not VPY.exists():
+        VPY = DEST / ".venv" / "Scripts" / "python.exe"
+else:
+    VPY = DEST / ".venv" / "bin" / "python"
 CFG_DIR = Path.home() / ".config" / "whisper-skill"
 HEALTH = CFG_DIR / "health.json"
 LOG = CFG_DIR / "supervisor.log"
 LOCK = CFG_DIR / "supervisor.lock"
 
+CREATE_NO_WINDOW = 0x08000000  # Windows: дочерний процесс без мигающего окна
+
 CHECK_INTERVAL = 3.0      # как часто проверять здоровье движка, сек
-GRACE_SEC = 35.0          # сколько НЕ судить здоровье после запуска (движок грузит модель), сек
+# Сколько НЕ судить здоровье после запуска (движок грузит модель), сек.
+# Windows - 90: Defender при первом старте сканирует свежий venv и DLL
+# onnxruntime, загрузка легко переваливает за 35с - иначе супервайзер
+# убивал бы движок посреди первой загрузки (находка совета).
+GRACE_SEC = 90.0 if IS_WIN else 35.0
 STALE_SEC = 30.0          # пульс старше этого = Python заклинен → перезапуск
 FAIL_LIMIT = 3            # столько подряд неудач старта записи = HAL застрял → перезапуск
 SLEEP_GAP_SEC = 15.0      # провал в часах супервайзера = Mac спал → дать движку очнуться
@@ -59,25 +73,148 @@ def log(msg: str) -> None:
     line = f"{time.strftime('%Y-%m-%d %H:%M:%S')}  {msg}"
     try:
         CFG_DIR.mkdir(parents=True, exist_ok=True)
-        with open(LOG, "a") as fh:
+        # encoding явно: без него Windows откроет файл в cp1251 и лог станет кашей
+        with open(LOG, "a", encoding="utf-8", errors="replace") as fh:
             fh.write(line + "\n")
     except Exception:
         pass
+    # под pythonw print - тихий no-op (sys.stdout=None), это безопасно
     print(line, flush=True)
 
 
-def acquire_singleton_lock():
-    """Не дать двум супервайзерам работать разом. Возвращает fd или None."""
-    import fcntl
+def acquire_singleton_lock() -> bool:
+    """Не дать двум супервайзерам работать разом.
+
+    Переиспользует единственную реализацию замка из движка (named mutex на
+    Windows / fcntl-файл на Unix) со СВОИМ именем - имена движка и
+    супервайзера обязаны различаться, иначе они подерутся за один замок."""
     try:
-        CFG_DIR.mkdir(parents=True, exist_ok=True)
-        fd = os.open(str(LOCK), os.O_CREAT | os.O_RDWR, 0o644)
-        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        os.ftruncate(fd, 0)
-        os.write(fd, str(os.getpid()).encode())
-        return fd
+        from examples.voice_dictation import acquire_single_instance_lock
+        return acquire_single_instance_lock(
+            timeout_seconds=0.5,
+            mutex_name="GigaamDictationSupervisor_SingleInstance",
+            lock_filename="supervisor.lock",
+        )
+    except Exception as e:
+        log(f"singleton lock недоступен ({e!r}) - продолжаю без замка")
+        return True
+
+
+def _notify_user_broken(text: str) -> None:
+    """Показать получателю окно «диктовка не запускается» - иначе отказ невидим
+    (супервайзер без окна). Best-effort, не роняет супервайзер."""
+    try:
+        if IS_WIN:
+            import ctypes
+            MB_OK, MB_ICONWARNING, MB_SYSTEMMODAL = 0x0, 0x30, 0x1000
+            ctypes.windll.user32.MessageBoxW(
+                None, text, "Диктовка ГигаАМ", MB_OK | MB_ICONWARNING | MB_SYSTEMMODAL
+            )
+        else:
+            subprocess.run(
+                ["osascript", "-e",
+                 f'display notification "{text}" with title "Диктовка ГигаАМ"'],
+                capture_output=True, timeout=5,
+            )
     except Exception:
-        return None
+        pass
+
+
+def _sweep_orphan_engines() -> None:
+    """Подчистить осиротевшие движки. На Windows - ТОЛЬКО python/pythonw с
+    examples.voice_dictation в командной строке (не трогаем чужой Python
+    получателя и не совпадаем с самим PowerShell-фильтром)."""
+    try:
+        if IS_WIN:
+            ps = (
+                "Get-CimInstance Win32_Process -Filter \"Name='python.exe' OR Name='pythonw.exe'\" | "
+                "Where-Object { $_.CommandLine -like '*examples.voice_dictation*' } | "
+                "ForEach-Object { Stop-Process -Id $_.ProcessId -Force }"
+            )
+            subprocess.run(
+                ["powershell", "-NoProfile", "-Command", ps],
+                capture_output=True, timeout=15, creationflags=CREATE_NO_WINDOW,
+            )
+        else:
+            subprocess.run(["pkill", "-9", "-f", "examples.voice_dictation"],
+                           capture_output=True, timeout=3)
+    except Exception:
+        pass
+
+
+# ─── Windows Job Object: движок умирает ВМЕСТЕ с супервайзером ───────────────
+# Если супервайзер убьют любым способом (Диспетчер задач, краш, taskkill) -
+# закрытие хэндла Job с флагом KILL_ON_JOB_CLOSE гарантированно убивает движок.
+# Иначе движок-сирота держит микрофон, а перезапустить его больше некому.
+_job_handle = None  # держим ссылку: закрытие хэндла = смерть процессов в Job
+
+
+def _win_assign_to_job(pid: int) -> bool:
+    global _job_handle
+    if not IS_WIN:
+        return False
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        kernel32 = ctypes.windll.kernel32
+
+        class IO_COUNTERS(ctypes.Structure):
+            _fields_ = [(n, ctypes.c_ulonglong) for n in (
+                "ReadOperationCount", "WriteOperationCount", "OtherOperationCount",
+                "ReadTransferCount", "WriteTransferCount", "OtherTransferCount")]
+
+        class JOBOBJECT_BASIC_LIMIT_INFORMATION(ctypes.Structure):
+            _fields_ = [
+                ("PerProcessUserTimeLimit", ctypes.c_longlong),
+                ("PerJobUserTimeLimit", ctypes.c_longlong),
+                ("LimitFlags", wintypes.DWORD),
+                ("MinimumWorkingSetSize", ctypes.c_size_t),
+                ("MaximumWorkingSetSize", ctypes.c_size_t),
+                ("ActiveProcessLimit", wintypes.DWORD),
+                ("Affinity", ctypes.c_size_t),
+                ("PriorityClass", wintypes.DWORD),
+                ("SchedulingClass", wintypes.DWORD),
+            ]
+
+        class JOBOBJECT_EXTENDED_LIMIT_INFORMATION(ctypes.Structure):
+            _fields_ = [
+                ("BasicLimitInformation", JOBOBJECT_BASIC_LIMIT_INFORMATION),
+                ("IoInfo", IO_COUNTERS),
+                ("ProcessMemoryLimit", ctypes.c_size_t),
+                ("JobMemoryLimit", ctypes.c_size_t),
+                ("PeakProcessMemoryUsed", ctypes.c_size_t),
+                ("PeakJobMemoryUsed", ctypes.c_size_t),
+            ]
+
+        JobObjectExtendedLimitInformation = 9
+        JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = 0x2000
+        PROCESS_SET_QUOTA = 0x0100
+        PROCESS_TERMINATE = 0x0001
+
+        if _job_handle is None:
+            h_job = kernel32.CreateJobObjectW(None, None)
+            if not h_job:
+                return False
+            info = JOBOBJECT_EXTENDED_LIMIT_INFORMATION()
+            info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+            if not kernel32.SetInformationJobObject(
+                h_job, JobObjectExtendedLimitInformation,
+                ctypes.byref(info), ctypes.sizeof(info),
+            ):
+                kernel32.CloseHandle(h_job)
+                return False
+            _job_handle = h_job
+
+        h_proc = kernel32.OpenProcess(PROCESS_SET_QUOTA | PROCESS_TERMINATE, False, pid)
+        if not h_proc:
+            return False
+        ok = bool(kernel32.AssignProcessToJobObject(_job_handle, h_proc))
+        kernel32.CloseHandle(h_proc)
+        return ok
+    except Exception as e:
+        log(f"Job Object не назначен ({e!r}) - движок без страховки от сироты")
+        return False
 
 
 class Engine:
@@ -97,14 +234,21 @@ class Engine:
             pass
         env = dict(os.environ)
         env["HF_HUB_OFFLINE"] = "1"
+        kwargs = {}
+        if IS_WIN:
+            kwargs["creationflags"] = CREATE_NO_WINDOW
         self.proc = subprocess.Popen(
             [str(VPY), "-m", "examples.voice_dictation"],
             cwd=str(DEST),
             env=env,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
+            **kwargs,
         )
         self.started_at = time.time()
+        if IS_WIN and not _win_assign_to_job(self.proc.pid):
+            # отказ без исключения (OpenProcess/Assign вернули 0) тоже должен быть виден
+            log("Job Object не назначен - движок без страховки от сироты")
         log(f"движок запущен, pid={self.proc.pid}")
 
     def alive(self) -> bool:
@@ -117,26 +261,38 @@ class Engine:
         if self.proc is None:
             return
         pid = self.proc.pid
-        # Сначала вежливо, потом -9: процесс, висящий в мьютексе CoreAudio
-        # (__psynch_mutexwait), на SIGKILL умирает (это не uninterruptible I/O).
-        for sig in (signal.SIGTERM, signal.SIGKILL):
-            if self.proc.poll() is not None:
-                break
-            try:
-                self.proc.send_signal(sig)
-            except Exception:
-                pass
-            try:
-                self.proc.wait(timeout=4.0)
-                break
-            except Exception:
-                continue
+        if IS_WIN:
+            # Windows: сигналов нет (SIGKILL отсутствует, SIGTERM не доставляется) -
+            # terminate() и kill() оба зовут TerminateProcess, этого достаточно.
+            for meth in (self.proc.terminate, self.proc.kill):
+                if self.proc.poll() is not None:
+                    break
+                try:
+                    meth()
+                except Exception:
+                    pass
+                try:
+                    self.proc.wait(timeout=4.0)
+                    break
+                except Exception:
+                    continue
+        else:
+            # Сначала вежливо, потом -9: процесс, висящий в мьютексе CoreAudio
+            # (__psynch_mutexwait), на SIGKILL умирает (это не uninterruptible I/O).
+            for sig in (signal.SIGTERM, signal.SIGKILL):
+                if self.proc.poll() is not None:
+                    break
+                try:
+                    self.proc.send_signal(sig)
+                except Exception:
+                    pass
+                try:
+                    self.proc.wait(timeout=4.0)
+                    break
+                except Exception:
+                    continue
         # Подчистить возможных «осиротевших» движков на всякий случай
-        try:
-            subprocess.run(["pkill", "-9", "-f", "examples.voice_dictation"],
-                           capture_output=True, timeout=3)
-        except Exception:
-            pass
+        _sweep_orphan_engines()
         log(f"движок остановлен, pid={pid}")
         self.proc = None
 
@@ -169,8 +325,7 @@ def health_verdict(engine: Engine, now: float) -> tuple[str, str]:
 
 
 def main():
-    lock_fd = acquire_singleton_lock()
-    if lock_fd is None:
+    if not acquire_singleton_lock():
         log("другой супервайзер уже работает - выхожу")
         return
 
@@ -192,6 +347,7 @@ def main():
 
     log(f"=== супервайзер запущен, pid={os.getpid()} ===")
     backoff = BACKOFF_BASE
+    fast_deaths = 0  # подряд мгновенных смертей движка (битая установка)
     engine.spawn()
     last_check = time.time()
 
@@ -211,6 +367,21 @@ def main():
             if not engine.alive():
                 code = engine.exit_code()
                 lived = now - engine.started_at
+                # Стоп-кран вечного цикла (находка совета): битая установка =
+                # движок умирает мгновенно снова и снова, супервайзер без окна
+                # крутил бы это НЕВИДИМО для получателя годами. 5 подряд смертей
+                # моложе 10с → сказать человеку и остановиться.
+                if lived < 10.0:
+                    fast_deaths += 1
+                else:
+                    fast_deaths = 0
+                if fast_deaths >= 5:
+                    log("движок умирает мгновенно 5 раз подряд - установка битая, останавливаюсь")
+                    _notify_user_broken(
+                        "Диктовка не запускается. Нажмите кнопку "
+                        "'Диктовка ГигаАМ - проверить' и напишите автору."
+                    )
+                    break
                 log(f"движок вышел (код {code}, прожил {lived:.0f}s) - перезапуск через {backoff:.0f}s")
                 time.sleep(backoff)
                 backoff = min(backoff * 2, BACKOFF_MAX)
@@ -237,4 +408,10 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except Exception as e:
+        # Последний рубеж видимости: любой краш супервайзера - в лог,
+        # иначе под pythonw он умер бы молча и бесследно.
+        log(f"ФАТАЛЬНО: супервайзер упал: {e!r}")
+        raise

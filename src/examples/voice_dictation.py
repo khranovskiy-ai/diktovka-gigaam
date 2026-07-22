@@ -1,5 +1,5 @@
 """
-Диктовка ГигаАМ - голосовой ввод (push-to-talk) для Mac, локально и бесплатно.
+Диктовка ГигаАМ - голосовой ввод (push-to-talk) для Mac и Windows, локально и бесплатно.
 
 Движок распознавания - GigaAM (русская модель, авторы ai-sage, лицензия MIT).
 Всё считается на вашем компьютере, в облако ничего не уходит.
@@ -9,7 +9,8 @@
     python -m examples.voice_dictation --config my-config.json # свой конфиг
 
 Как работает:
-    1. Скрипт висит в фоне, слушает глобальную клавишу (по умолчанию Option).
+    1. Скрипт висит в фоне, слушает глобальную клавишу
+       (по умолчанию: Option на Mac, ПРАВЫЙ Ctrl на Windows).
     2. Зажал клавишу - идёт запись, говоришь по-русски.
     3. Отпустил - GigaAM распознаёт, текст вставляется в активное поле.
 
@@ -17,7 +18,8 @@
     pip install onnx-asr sounddevice soundfile pynput pyperclip numpy
 
 Разрешения macOS (один раз): Микрофон, Универсальный доступ (вставка),
-Мониторинг ввода (слышать клавишу). Звук и текст никуда не отправляются.
+Мониторинг ввода (слышать клавишу). На Windows разрешения не нужны (только
+доступ к микрофону в Параметрах). Звук и текст никуда не отправляются.
 """
 
 from __future__ import annotations
@@ -47,7 +49,10 @@ os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
 
 
 DEFAULT_CONFIG = {
-    "hotkey": "<alt_r>",  # формат pynput Listener
+    # Клавиша диктовки, формат pynput. Дефолт зависит от ОС:
+    # Mac - Option (любой); Windows - ПРАВЫЙ Ctrl (Alt нельзя: Alt+Tab и фокус
+    # меню приложений при отпускании; левый Ctrl нельзя: Ctrl+C/V/S).
+    "hotkey": "<ctrl_r>" if platform.system() == "Windows" else "<alt>",
     "mode": "ptt",                       # "ptt" (push-to-talk) или "toggle"
     "language": None,                    # null = auto. Лучше указать ("ru", "en")
     "model": "large-v3-turbo",
@@ -135,12 +140,19 @@ def list_available_ov_models() -> list:
 _single_instance_handle = None  # держим ссылку чтобы lock не сборщик мусора убил
 
 
-def acquire_single_instance_lock(timeout_seconds: float = 2.0) -> bool:
+def acquire_single_instance_lock(
+    timeout_seconds: float = 2.0,
+    mutex_name: str = "WhisperVoiceDictation_SingleInstance",
+    lock_filename: str = "voice_dictation.lock",
+) -> bool:
     """Захватить named mutex (Windows) / file lock (Unix). True - захватили.
     False - другая копия уже работает.
 
     timeout_seconds покрывает self-restart: старая копия только что вызвала
     os._exit, новая стартует, ОС ещё не успела освободить lock - повторяем.
+    mutex_name/lock_filename параметризованы, чтобы супервайзер переиспользовал
+    ЭТУ ЖЕ функцию со СВОИМ именем (второй реализации замка в проекте нет);
+    имена движка и супервайзера обязаны различаться - иначе подерутся.
     """
     global _single_instance_handle
     deadline = time.monotonic() + timeout_seconds
@@ -150,7 +162,7 @@ def acquire_single_instance_lock(timeout_seconds: float = 2.0) -> bool:
         kernel32 = ctypes.windll.kernel32
         ERROR_ALREADY_EXISTS = 183
         while True:
-            handle = kernel32.CreateMutexW(None, True, "WhisperVoiceDictation_SingleInstance")
+            handle = kernel32.CreateMutexW(None, True, mutex_name)
             if kernel32.GetLastError() != ERROR_ALREADY_EXISTS:
                 _single_instance_handle = handle
                 return True
@@ -163,7 +175,7 @@ def acquire_single_instance_lock(timeout_seconds: float = 2.0) -> bool:
             import fcntl
         except ImportError:
             return True  # нет fcntl - пропускаем lock (Win-вариант покрыт выше)
-        lock_path = Path.home() / ".config" / "whisper-skill" / "voice_dictation.lock"
+        lock_path = Path.home() / ".config" / "whisper-skill" / lock_filename
         lock_path.parent.mkdir(parents=True, exist_ok=True)
         while True:
             fh = open(lock_path, "a+")
@@ -181,26 +193,19 @@ def acquire_single_instance_lock(timeout_seconds: float = 2.0) -> bool:
 
 
 def restart_self() -> None:
-    """Завершить текущий процесс и запустить новую копию через VBS launcher.
+    """Завершить текущий процесс и запустить новую копию.
     Используется при смене модели через tray-меню."""
     repo_root = Path(__file__).resolve().parents[1]
     if platform.system() == "Windows":
-        vbs = repo_root / "launcher" / "voice_dictation_silent.vbs"
         DETACHED_PROCESS = 0x00000008
         CREATE_NEW_PROCESS_GROUP = 0x00000200
-        if vbs.exists():
-            subprocess.Popen(
-                ["wscript.exe", str(vbs)],
-                creationflags=DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP,
-                close_fds=True,
-            )
-        else:
-            subprocess.Popen(
-                [sys.executable, "-m", "examples.voice_dictation"],
-                cwd=str(repo_root),
-                creationflags=DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP,
-                close_fds=True,
-            )
+        CREATE_NO_WINDOW = 0x08000000
+        subprocess.Popen(
+            [sys.executable, "-m", "examples.voice_dictation"],
+            cwd=str(repo_root),
+            creationflags=DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW,
+            close_fds=True,
+        )
     else:
         subprocess.Popen(
             [sys.executable, "-m", "examples.voice_dictation"],
@@ -698,6 +703,37 @@ def restore_clipboard_deferred(saved: Optional[str], delay_sec: float = 1.0) -> 
     threading.Thread(target=_do, daemon=True).start()
 
 
+# Win32 virtual-key коды. ЕДИНСТВЕННАЯ таблица VK в модуле - используется и
+# вставкой (_windows_paste), и сторожем физического состояния клавиши
+# (_win_vk_codes_for_keys → жнец потерянного отпускания). Вторую не заводить.
+_WIN_VK = {
+    "ctrl": 0x11, "lctrl": 0xA2, "rctrl": 0xA3,
+    "alt": 0x12, "lalt": 0xA4, "ralt": 0xA5,
+    "shift": 0x10, "lshift": 0xA0, "rshift": 0xA1,
+    "lwin": 0x5B, "rwin": 0x5C,
+    "v": 0x56,
+}
+
+
+def _win_vk_codes_for_keys(keys: set) -> tuple:
+    """Имена клавиш хоткея (формат _parse_hotkey: 'ctrl_r', 'alt', ...) →
+    VK-коды для физической проверки GetAsyncKeyState. Пустой кортеж =
+    клавиша не из модификаторов, физическая проверка недоступна (жнец
+    перейдёт в режим «только потолок» - как на Mac без Quartz)."""
+    name_map = {
+        "alt": ("lalt", "ralt", "alt"), "alt_l": ("lalt",), "alt_r": ("ralt",),
+        "alt_gr": ("ralt",),
+        "ctrl": ("lctrl", "rctrl", "ctrl"), "ctrl_l": ("lctrl",), "ctrl_r": ("rctrl",),
+        "shift": ("lshift", "rshift", "shift"), "shift_l": ("lshift",), "shift_r": ("rshift",),
+        "cmd": ("lwin", "rwin"), "cmd_l": ("lwin",), "cmd_r": ("rwin",),
+    }
+    out = set()
+    for k in keys:
+        for alias in name_map.get(k, ()):
+            out.add(_WIN_VK[alias])
+    return tuple(sorted(out))
+
+
 def _windows_paste() -> None:
     """Надёжная симуляция Ctrl+V на Windows через Win32 SendInput.
 
@@ -710,13 +746,7 @@ def _windows_paste() -> None:
     user32 = ctypes.windll.user32
 
     KEYEVENTF_KEYUP = 0x0002
-    VK = {
-        "ctrl": 0x11, "lctrl": 0xA2, "rctrl": 0xA3,
-        "alt": 0x12, "lalt": 0xA4, "ralt": 0xA5,
-        "shift": 0x10, "lshift": 0xA0, "rshift": 0xA1,
-        "lwin": 0x5B, "rwin": 0x5C,
-        "v": 0x56,
-    }
+    VK = _WIN_VK
     # 1) Release any held modifiers (idempotent - release of unpressed key is no-op)
     for name in ("lctrl", "rctrl", "ctrl", "lalt", "ralt", "alt",
                  "lshift", "rshift", "shift", "lwin", "rwin"):
@@ -1264,6 +1294,9 @@ def main_loop(cfg: dict, cfg_path: Path):
         cfg["sample_rate"], cfg["channels"],
         idle_release_sec=cfg.get("idle_release_sec", 0),
     )
+    # Человекочитаемое имя клавиши для ВСЕХ сообщений пользователю
+    # («Зажми Option» на Windows врало бы - там ПРАВЫЙ Ctrl).
+    hk_name = _hotkey_human(cfg["hotkey"])
 
     # macOS low-CPU mode: pystray в фоне и Tk у нас вызывают серьёзный
     # idle-CPU на маке (наблюдалось ~90% на M-чипе). Дефолтно отключаем оба
@@ -1377,7 +1410,7 @@ def main_loop(cfg: dict, cfg_path: Path):
                 state.is_recording = False
                 state.audio_fail_streak += 1
                 streak = state.audio_fail_streak
-            print(f"❌ Не удалось начать запись (аудио занято, подряд: {streak}) - отпусти и нажми Option ещё раз")
+            print(f"❌ Не удалось начать запись (аудио занято, подряд: {streak}) - отпусти и нажми {hk_name} ещё раз")
             tray.set_state("idle")
             if cursor_ind:
                 cursor_ind.hide()
@@ -1498,26 +1531,36 @@ def main_loop(cfg: dict, cfg_path: Path):
     hotkey_str = cfg["hotkey"]
     engine = "ГигаАМ" if str(cfg.get("model", "")).startswith("gigaam") else cfg.get("backend", "")
     print(f"🎤 Диктовка {engine} работает (движок: {cfg['model']})")
-    print(f"   Зажми Option (хоткей {hotkey_str}, режим {cfg['mode']})")
+    print(f"   Зажми {hk_name} (хоткей {hotkey_str}, режим {cfg['mode']})")
     print(f"   Язык:   {cfg.get('language') or 'auto'}")
-    print(f"\nЗажми {hotkey_str} чтобы говорить. Ctrl+C чтобы выйти.\n")
+    print(f"\nЗажми {hk_name} чтобы говорить. Ctrl+C чтобы выйти.\n")
 
     if cfg["mode"] == "ptt":
         # Push-to-talk: нажал → запись, отпустил → транскрибировать
         # У pynput GlobalHotKeys работает по нажатию. Для PTT отслеживаем сами через Listener.
         keys_needed = _parse_hotkey(hotkey_str)
         currently_pressed = set()
+        # Флаг «пересоздай слушатель»: ставит обратный сторож мёртвого хука
+        # (см. _lost_release_reaper), читает главный цикл слушателя ниже.
+        listener_refresh = {"flag": False}
 
+        # В currently_pressed кладём И канон («ctrl» - сторона срезана), И raw-имя
+        # («ctrl_r»). Так работают ОБА вида хоткея: обобщённый <alt> (Mac, любой
+        # Option - как раньше) и side-specific <ctrl_r> (Windows, только правый
+        # Ctrl - левый, которым копируют, диктовку не дёргает).
         def on_press(key):
             currently_pressed.add(_canonical_key(key))
+            currently_pressed.add(_raw_key_name(key))
             if keys_needed.issubset(currently_pressed):
                 start_recording()
 
         def on_release(key):
             ck = _canonical_key(key)
-            if ck in keys_needed and state.is_recording:
+            rk = _raw_key_name(key)
+            if (ck in keys_needed or rk in keys_needed) and state.is_recording:
                 stop_and_transcribe()
             currently_pressed.discard(ck)
+            currently_pressed.discard(rk)
 
         # Супервайзер слуха: pynput-рунлуп ломается/зависает при сне-пробуждении Mac
         # (CFRunLoopRunInMode возвращает не-timeout → поток слушателя выходит, ЛИБО
@@ -1541,7 +1584,7 @@ def main_loop(cfg: dict, cfg_path: Path):
                         except Exception:
                             pass
                 logging.info(f"hearing revived ({reason}); stuck state reset")
-                print(f"♻️  Слух перезапущен ({reason}) - снова слушаю Option")
+                print(f"♻️  Слух перезапущен ({reason}) - снова слушаю {hk_name}")
             except Exception as e:
                 logging.warning(f"reset stuck state failed: {e}")
 
@@ -1558,17 +1601,36 @@ def main_loop(cfg: dict, cfg_path: Path):
         # восстановится). Дебаунс в 2 тика гасит одиночный глюк чтения. Потолок
         # max_record_sec - резерв, когда HID-чтение недоступно (там сбрасываем без вставки).
         def _lost_release_reaper():
-            try:
-                from Quartz import (
-                    CGEventSourceKeyState,
-                    kCGEventSourceStateCombinedSessionState as _SRC,
-                )
-            except Exception as e:
-                CGEventSourceKeyState = None
-                _SRC = None
-                logging.warning(f"lost-release reaper: Quartz keystate недоступен ({e}); работает только потолок")
-            OPTION_KEYCODES = (58, 61)  # левый/правый Option
-            has_keystate = CGEventSourceKeyState is not None
+            # Физическая проверка «клавиша хоткея сейчас зажата?» - платформенно:
+            # Mac - Quartz CGEventSourceKeyState (Option, keycodes 58/61 - как было);
+            # Windows - GetAsyncKeyState по VK-кодам, выведенным из хоткея (общая
+            # таблица _WIN_VK). Недоступно - режим «только потолок max_record_sec».
+            phys_down_fn = None
+            if platform.system() == "Darwin":
+                try:
+                    from Quartz import (
+                        CGEventSourceKeyState,
+                        kCGEventSourceStateCombinedSessionState as _SRC,
+                    )
+                    OPTION_KEYCODES = (58, 61)  # левый/правый Option
+
+                    def phys_down_fn():
+                        return any(CGEventSourceKeyState(_SRC, kc) for kc in OPTION_KEYCODES)
+                except Exception as e:
+                    logging.warning(f"lost-release reaper: Quartz keystate недоступен ({e}); работает только потолок")
+            elif platform.system() == "Windows":
+                try:
+                    import ctypes
+                    _u32 = ctypes.windll.user32
+                    _vks = _win_vk_codes_for_keys(keys_needed)
+                    if _vks:
+                        def phys_down_fn():
+                            return any(bool(_u32.GetAsyncKeyState(vk) & 0x8000) for vk in _vks)
+                    else:
+                        logging.warning("lost-release reaper: хоткей не из модификаторов - только потолок")
+                except Exception as e:
+                    logging.warning(f"lost-release reaper: GetAsyncKeyState недоступен ({e}); только потолок")
+            has_keystate = phys_down_fn is not None
             max_sec = float(cfg.get("max_record_sec", 90) or 90)
             # Потолок на распознавание: gigaam на CPU ~30x realtime (90с речи → ~3с),
             # плюс запас на холодный warmup модели (~30с на первой диктовке). 120с
@@ -1579,6 +1641,7 @@ def main_loop(cfg: dict, cfg_path: Path):
             # тикать, поэтому супервайзер его НЕ ловит - лечим только здесь.
             transcribe_stuck_sec = float(cfg.get("transcribe_stuck_sec", 120) or 120)
             up_ticks = 0
+            down_unseen_ticks = 0  # тики «клавиша физически зажата, а событий от хука нет»
             while True:
                 time.sleep(1.0)
                 try:
@@ -1604,20 +1667,43 @@ def main_loop(cfg: dict, cfg_path: Path):
                         started = state.recording_started_at
                     if not rec or not started:
                         up_ticks = 0
+                        # ─── Обратный сторож МЁРТВОГО ХУКА (находка совета, high) ───
+                        # Windows МОЛЧА снимает WH_KEYBOARD_LL-хук при таймауте колбэка
+                        # (LowLevelHooksTimeout): поток слушателя ЖИВ (is_alive - true),
+                        # heartbeat тикает, супервайзер доволен - а хоткей не ловится
+                        # НИКОГДА. Детект: клавиша хоткея ФИЗИЧЕСКИ зажата ≥3 тика
+                        # подряд, а on_press так и не пришёл (хоткея нет в
+                        # currently_pressed, запись не началась) → хук мёртв → просим
+                        # главный цикл пересоздать слушатель (свежий хук). На Mac тот же
+                        # детект дополнительно ловит мёртвый event tap.
+                        if has_keystate and phys_down_fn():
+                            if not keys_needed.issubset(currently_pressed):
+                                down_unseen_ticks += 1
+                                if down_unseen_ticks >= 3:
+                                    down_unseen_ticks = 0
+                                    logging.warning(
+                                        "dead-hook watchdog: клавиша физически зажата, "
+                                        "а событий от хука нет - пересоздаю слушатель"
+                                    )
+                                    print(f"♻️  Слух не отвечает при зажатой {hk_name} - перезапускаю слушатель")
+                                    listener_refresh["flag"] = True
+                            else:
+                                down_unseen_ticks = 0
+                        else:
+                            down_unseen_ticks = 0
                         continue
+                    down_unseen_ticks = 0
                     held = time.time() - started
                     if has_keystate:
-                        phys_up = not any(
-                            CGEventSourceKeyState(_SRC, kc) for kc in OPTION_KEYCODES
-                        )
+                        phys_up = not phys_down_fn()
                         up_ticks = up_ticks + 1 if phys_up else 0
                     decision = _reaper_decision(rec, held, up_ticks, has_keystate, max_sec)
                     if decision == "finalize":
                         logging.warning(
-                            f"lost-release reaper: Option отпущен/потолок, is_recording завис "
+                            f"lost-release reaper: {hk_name} отпущен/потолок, is_recording завис "
                             f"(удержание {held:.1f}s) - завершаю запись сам"
                         )
-                        print("♻️  Поймал потерянное отпускание Option - завершаю запись сам")
+                        print(f"♻️  Поймал потерянное отпускание {hk_name} - завершаю запись сам")
                         up_ticks = 0
                         currently_pressed.clear()
                         stop_and_transcribe()  # идемпотентно: под локом проверит is_recording
@@ -1691,8 +1777,14 @@ def main_loop(cfg: dict, cfg_path: Path):
                     gap = now - last_tick
                     last_tick = now
                     if gap > 8.0:
-                        # провал по часам >> 2с = Mac спал → tap оглох, пересоздаём
+                        # провал по часам >> 2с = машина спала → перехват оглох, пересоздаём
                         logging.info(f"sleep gap {gap:.0f}s detected - recreating listener")
+                        break
+                    if listener_refresh["flag"]:
+                        # обратный сторож мёртвого хука поймал «клавиша зажата,
+                        # событий нет» → пересоздаём слушатель (свежий хук/tap)
+                        listener_refresh["flag"] = False
+                        logging.info("dead-hook watchdog requested listener recreation")
                         break
             except KeyboardInterrupt:
                 try:
@@ -1747,6 +1839,31 @@ def _canonical_key(key) -> str:
             return key.char.lower()
         return str(key)
     return str(key).lower()
+
+
+def _raw_key_name(key) -> str:
+    """Полное имя клавиши pynput С суффиксом стороны ('ctrl_r') - пара к
+    _canonical_key (тот сторону срезает). Нужно side-specific хоткеям вроде
+    <ctrl_r> на Windows: матчим и обобщённое имя, и точную сторону."""
+    from pynput.keyboard import Key
+    if isinstance(key, Key):
+        return key.name
+    return _canonical_key(key)
+
+
+def _hotkey_human(hotkey_str: str) -> str:
+    """Человекочитаемое имя клавиши для сообщений пользователю."""
+    mac = platform.system() == "Darwin"
+    names = {
+        "<alt>": "Option" if mac else "Alt",
+        "<alt_l>": "левый Option" if mac else "левый Alt",
+        "<alt_r>": "правый Option" if mac else "правый Alt",
+        "<ctrl>": "Ctrl",
+        "<ctrl_l>": "левый Ctrl",
+        "<ctrl_r>": "ПРАВЫЙ Ctrl",
+        "<cmd>": "Cmd" if mac else "Win",
+    }
+    return names.get(hotkey_str.strip().lower().replace(" ", ""), hotkey_str)
 
 
 # ─── Entry point ────────────────────────────────────────────────────────────

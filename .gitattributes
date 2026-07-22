@@ -1,0 +1,4 @@
+# .bat/.ps1 живут на Mac, но исполняются на Windows: держим CRLF, чтобы cmd.exe
+# не глючил на LF-метках, а ps1 не терял BOM (проверяется и сборщиком архива).
+*.bat text eol=crlf
+*.ps1 text eol=crlf

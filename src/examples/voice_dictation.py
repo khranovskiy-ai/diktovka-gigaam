@@ -64,7 +64,7 @@ DEFAULT_CONFIG = {
     "trim_silence_ms": 200,              # обрезать тишину в начале/конце записи
     "min_duration_ms": 300,              # игнорировать слишком короткие записи (промахи кнопкой)
     "max_record_sec": 90,                # потолок одной записи: дольше = потеряно отпускание Option, сторож сам завершит/сбросит
-    "idle_release_sec": 180,             # отпустить микрофон (закрыть поток, погасить оранжевую точку) после стольких секунд без диктовки; 0 = держать открытым всегда
+    "idle_release_sec": 0,               # 0 = микрофон открыт, пока диктовка включена (надёжно). Значение >0 (сек простоя до отпускания) гасит оранжевую точку, но на части Маков закрытие потока клинит CoreAudio - не включайте без нужды
     "transcribe_stuck_sec": 120,         # если распознавание висит дольше - сбросить залипший флаг is_transcribing (сторож)
     # macOS-специфика: pystray/Tk известно жрут CPU в фоне на macOS
     # (NSRunLoop в non-main thread + Tk thread-safety). Этот флаг автоматически
@@ -1262,7 +1262,7 @@ def main_loop(cfg: dict, cfg_path: Path):
     state_lock = threading.Lock()
     recorder = AudioRecorder(
         cfg["sample_rate"], cfg["channels"],
-        idle_release_sec=cfg.get("idle_release_sec", 180),
+        idle_release_sec=cfg.get("idle_release_sec", 0),
     )
 
     # macOS low-CPU mode: pystray в фоне и Tk у нас вызывают серьёзный

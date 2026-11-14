@@ -1,0 +1,26 @@
+{
+  "name": "gigaam-vstavka",
+  "displayName": "Диктовка ГигаАМ: вставка",
+  "description": "Поднимает локальную диктовку ГигаАМ при запуске VS Code (у VS Code есть разрешения на слух клавиш и микрофон) и вставляет надиктованное штатной командой VS Code, без синтетического Cmd+V (Punto Switcher её не глушит).",
+  "version": "1.2.0",
+  "publisher": "novotels",
+  "license": "UNLICENSED",
+  "engines": {
+    "vscode": "^1.80.0"
+  },
+  "extensionKind": [
+    "ui"
+  ],
+  "main": "./extension.js",
+  "activationEvents": [
+    "onStartupFinished"
+  ],
+  "contributes": {
+    "commands": [
+      {
+        "command": "gigaamVstavka.perezapusk",
+        "title": "Диктовка ГигаАМ: перезапустить"
+      }
+    ]
+  }
+}

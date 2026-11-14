@@ -774,10 +774,66 @@ def _paste_debug(msg: str) -> None:
         pass
 
 
+_VSCODE_SOCK_DIR = os.path.expanduser("~/.config/whisper-skill/vscode")
+
+
+def _vscode_paste() -> bool:
+    """Вставка в VS Code БЕЗ клавиатуры (14.11.2026).
+
+    Расширение «Диктовка ГигаАМ: вставка» (~/.gigaam-dictation/vscode-vstavka) в каждом окне
+    VS Code слушает Unix-сокет <pid>.sock. Окно в фокусе по строке "paste" выполняет штатную
+    команду editor.action.clipboardPasteAction - она кладёт буфер в редактор, в веб-панель
+    (чат Claude Code) и в терминал. Синтетического Cmd+V нет, поэтому Punto Switcher её
+    не глушит и его больше не нужно гасить. True - окно VS Code подтвердило вставку;
+    False - VS Code не в фокусе или расширения нет (тогда прежний Cmd+V)."""
+    import glob
+    import socket
+    for p in glob.glob(os.path.join(_VSCODE_SOCK_DIR, "*.sock")):
+        resp = ""
+        try:
+            s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            s.settimeout(1.5)
+            try:
+                s.connect(p)
+                s.sendall(b"paste\n")
+                resp = s.recv(256).decode(errors="replace").strip()
+            finally:
+                s.close()
+        except (ConnectionRefusedError, FileNotFoundError):
+            # Окно закрыто, сокет остался - слушателя нет, файл убираем.
+            try:
+                os.unlink(p)
+            except OSError:
+                pass
+            continue
+        except socket.timeout:
+            # Команду могли уже выполнить, а ответ опоздал. Запасной Cmd+V тогда дал бы ДУБЛЬ -
+            # считаем вставку состоявшейся; текст остаётся в буфере (аудит Кодекса 14.11.2026).
+            _paste_debug(f"vscode: {os.path.basename(p)} TIMEOUT - исход неизвестен, Cmd+V не шлём")
+            print("ℹ️ VS Code не ответил вовремя - если текста нет, нажмите Cmd+V (он в буфере)")
+            return True
+        except Exception as e:
+            _paste_debug(f"vscode: {os.path.basename(p)} EXC {e}")
+            continue
+        _paste_debug(f"vscode: {os.path.basename(p)} -> {resp}")
+        if resp == "ok" or resp.startswith("error"):
+            # error - команда VS Code упала внутри окна в фокусе; Cmd+V туда же Punto всё равно заглушит,
+            # а при частичной вставке дал бы дубль. Текст в буфере.
+            return True
+    return False
+
+
 def paste_from_clipboard() -> None:
     """Симулировать Cmd+V (Mac) или Ctrl+V (Linux/Win). Пишет диагностику в paste_debug.log."""
-    # macOS: сначала Quartz Cmd+V с ЯВНЫМ флагом Command, потом pynput, потом System Events.
+    # macOS: сначала VS Code без клавиатуры, потом Quartz Cmd+V с ЯВНЫМ флагом Command,
+    # потом pynput, потом System Events.
     if platform.system() == "Darwin":
+        try:
+            if _vscode_paste():
+                print("📥 Вставлено (VS Code, без клавиатуры)")
+                return
+        except Exception as e:
+            _paste_debug(f"vscode: EXC {e}")
         # 0) Quartz Cmd+V с явным флагом Command - НАДЁЖНЫЙ путь.
         #    pynput в этой версии НЕ применяет модификатор Command к 'v' → синтетический
         #    Cmd+V не срабатывал (текст копировался в буфер, в логе «Вставлено», но вставки

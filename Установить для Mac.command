@@ -77,7 +77,7 @@ echo "ок (версии и хэши проверены)"
 # --- 5. кнопки на Рабочем столе (рабочие шаблоны из пакета) ---
 step "Шаг 5 из 5: кнопки на Рабочем столе"
 DESK="$HOME/Desktop"
-# рабочие кнопки (гасят PuntoSwitcher на время диктовки, окно закрывается само)
+# рабочие кнопки (окно закрывается само; Punto Switcher работает вместе с диктовкой)
 cp "$HERE/launchers/Диктовка ГигаАМ - включить.command" "$DESK/"
 cp "$HERE/launchers/Диктовка ГигаАМ - выключить.command" "$DESK/"
 cp "$HERE/launchers/Диктовка ГигаАМ - проверить.command" "$DESK/" 2>/dev/null || true
@@ -86,6 +86,8 @@ cat > "$DESK/Диктовка ГигаАМ - удалить.command" <<'DEL'
 #!/bin/bash
 pkill -f "examples.supervisor" 2>/dev/null; sleep 1
 pkill -f "examples.voice_dictation" 2>/dev/null
+CODE_CLI="/Applications/Visual Studio Code.app/Contents/Resources/app/bin/code"
+[ -x "$CODE_CLI" ] && "$CODE_CLI" --uninstall-extension novotels.gigaam-vstavka >/dev/null 2>&1
 rm -rf "$HOME/.gigaam-dictation"
 rm -rf "$HOME/.config/whisper-skill"
 rm -rf "$HOME/.cache/huggingface/hub/models--istupakov--gigaam-v3-onnx"
@@ -97,6 +99,22 @@ DEL
 
 chmod +x "$DESK/Диктовка ГигаАМ - включить.command" "$DESK/Диктовка ГигаАМ - выключить.command" "$DESK/Диктовка ГигаАМ - проверить.command" "$DESK/Диктовка ГигаАМ - удалить.command"
 echo "ок"
+
+# --- Punto Switcher: снять только его одиночный Option (иначе он переворачивает надиктованное) ---
+/bin/bash "$DEST/scripts/punto_option.sh" 2>/dev/null || true
+
+# --- VS Code: вставка без клавиатуры (если VS Code стоит) ---
+CODE_CLI="/Applications/Visual Studio Code.app/Contents/Resources/app/bin/code"
+if [ -x "$CODE_CLI" ]; then
+  step "VS Code найден: ставлю расширение вставки"
+  # Окно VS Code в фокусе само вставляет надиктованное штатной командой - в редактор,
+  # чат ИИ-помощника и терминал, без нажатия Cmd+V. Запускать диктовку оно не будет.
+  if "$CODE_CLI" --install-extension "$HERE/vscode-vstavka/gigaam-vstavka-1.2.0.vsix" --force >/dev/null 2>&1; then
+    echo "ок (если VS Code открыт - начнёт работать сразу или после его перезапуска)"
+  else
+    echo "не вышло - не страшно, в VS Code вставка пойдёт обычным Cmd+V"
+  fi
+fi
 
 # --- проверка движка: убедиться, что это ГигаАМ, а не Whisper ---
 step "Проверяю, что распознаёт именно ГигаАМ..."
